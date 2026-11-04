@@ -228,14 +228,29 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Run as an MCP server over stdio so agents can query disk usage.
-    Mcp,
+    /// Run as an MCP server (stdio by default) so AI agents can explore disk usage.
+    Mcp {
+        /// Only allow access inside this folder. Repeatable. Default: anywhere.
+        #[arg(long = "root", value_name = "DIR")]
+        roots: Vec<PathBuf>,
+        /// Add the move_to_trash tool (recoverable, refuses system folders).
+        #[arg(long)]
+        allow_delete: bool,
+        /// Serve over HTTP at ADDR (e.g. 127.0.0.1:8765) instead of stdio.
+        #[arg(long, value_name = "ADDR")]
+        http: Option<std::net::SocketAddr>,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_result = Config::load(cli.config.as_deref());
-    if let Command::Mcp = cli.command {
+    if let Command::Mcp {
+        roots,
+        allow_delete,
+        http,
+    } = cli.command
+    {
         // stdout carries the MCP protocol, so logs must go to stderr.
         tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
@@ -246,7 +261,12 @@ fn main() -> Result<()> {
             tracing::warn!("ignoring config file: {e}");
             Config::default()
         });
-        return tokio::runtime::Runtime::new()?.block_on(mcp::serve(cfg));
+        let opts = mcp::McpOptions {
+            roots,
+            allow_delete,
+            http,
+        };
+        return tokio::runtime::Runtime::new()?.block_on(mcp::serve(cfg, opts));
     }
     if let Command::Drives { all, json } = cli.command {
         let d = drives::list_drives(all);
@@ -259,7 +279,7 @@ fn main() -> Result<()> {
     }
     let cfg = config_result.map_err(|e| anyhow::anyhow!("config error: {e}"))?;
     match cli.command {
-        Command::Mcp | Command::Drives { .. } => unreachable!("handled above"),
+        Command::Mcp { .. } | Command::Drives { .. } => unreachable!("handled above"),
         Command::Ui { scan } => {
             let s = scan.run(&cfg)?;
             ui::run(s, scan.mode())

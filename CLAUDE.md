@@ -15,7 +15,8 @@ TreeSize-style disk usage CLI for Windows + Linux with a built-in MCP server. Ro
 ## Rules
 - Code must work on both Windows and Linux. Put OS-specific code behind `#[cfg(windows)]` / `#[cfg(unix)]` with a fallback.
 - Never follow symlinks or junctions inside a scan (`DirEntry::metadata` does not follow them). The root path the user names is resolved with `resolve_path`; use the same function on any path you look up in a scan.
-- MCP tools are read-only and marked `read_only_hint = true`. Any destructive tool must be opt-in via a server flag (see PLAN.md, Milestone 4).
+- MCP tools are read-only and marked `read_only_hint = true`. The only destructive tool, `move_to_trash`, is removed from the router unless `--allow-delete` is set. All deletion goes through `remove.rs` (trash only, `safety::protection_reason` check).
+- Tests must not touch the real Recycle Bin: the e2e tests set `CLEANMCP_TEST_TRASH_DIR`, `CLEANMCP_DATA_DIR` and `CLEANMCP_CONFIG`.
 - In `mcp` mode stdout is the protocol channel: log to stderr only, never `println!`.
 - MCP tool results must be JSON objects (wrap lists in a struct).
 - rmcp is 3.x; its API differs from older 0.x examples online. Check `~/.cargo/registry/src/*/rmcp-3.*/tests/` for current usage.

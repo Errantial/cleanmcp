@@ -185,16 +185,30 @@ pub struct TreeJson {
 
 impl TreeJson {
     pub fn build(node: &Node, path: &Path, depth: usize, top: usize, mode: SizeMode) -> Self {
+        Self::build_page(node, path, depth, top, 0, mode)
+    }
+
+    /// Like [`build`], skipping the first `offset` children at the top level.
+    /// `other_*` then counts the children after this page.
+    pub fn build_page(
+        node: &Node,
+        path: &Path,
+        depth: usize,
+        top: usize,
+        offset: usize,
+        mode: SizeMode,
+    ) -> Self {
         let (children, other_disk_size, other_count) = if depth == 0 {
             (Vec::new(), 0, 0)
         } else {
             let sorted = node.sorted_children(mode);
-            let kids = sorted
+            let start = offset.min(sorted.len());
+            let kids = sorted[start..]
                 .iter()
                 .take(top)
-                .map(|c| TreeJson::build(c, &path.join(&*c.name), depth - 1, top, mode))
+                .map(|c| TreeJson::build(c, &path.join(c.name.as_str()), depth - 1, top, mode))
                 .collect();
-            let rest = sorted.get(top..).unwrap_or_default();
+            let rest = sorted.get(start + top..).unwrap_or_default();
             (kids, rest.iter().map(|c| c.disk_size).sum(), rest.len())
         };
         TreeJson {
@@ -208,6 +222,14 @@ impl TreeJson {
             other_disk_size,
             other_count,
             children,
+        }
+    }
+
+    /// Every path in this tree (for the MCP "seen paths" list).
+    pub fn collect_paths(&self, out: &mut Vec<PathBuf>) {
+        out.push(self.path.clone());
+        for c in &self.children {
+            c.collect_paths(out);
         }
     }
 }

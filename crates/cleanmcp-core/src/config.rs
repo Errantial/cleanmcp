@@ -34,6 +34,11 @@ pub struct Config {
     pub rules: Vec<Rule>,
 }
 
+/// Where logs and other app data go: `%LOCALAPPDATA%\cleanmcp` or `~/.local/share/cleanmcp`.
+pub fn data_dir() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("cleanmcp"))
+}
+
 /// Where the config file is read from.
 pub fn config_path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("CLEANMCP_CONFIG") {

@@ -49,27 +49,17 @@ System folders, drive roots and your home folder are always refused. `suggest` l
 
 ## MCP server
 
-`cleanmcp mcp` runs an MCP server over stdio with read-only tools:
-
-| Tool | What it does |
-|---|---|
-| `scan_directory` | Scan a folder/drive, return total size and largest children (cached) |
-| `list_children` | Drill into a directory, sorted by size |
-| `largest_files` | Biggest files, optionally only old ones |
-| `extension_breakdown` | Usage per file type |
-| `find_cleanup_candidates` | Folders that are usually safe to remove, with reasons |
-
-Claude Code:
+`cleanmcp mcp` runs an MCP server (stdio, or HTTP with `--http`) so agents like Claude can explore
+your disks and suggest what to clean. Tools: `list_drives`, `scan_directory`, `list_children`,
+`largest_files`, `extension_breakdown`, `age_breakdown`, `find_cleanup_candidates`, `find_duplicates`.
+All read-only. `--allow-delete` adds `move_to_trash` (Recycle Bin only, refuses system folders,
+audit-logged) and `--root DIR` limits what the agent can see.
 
 ```sh
-claude mcp add cleanmcp -- cleanmcp mcp
+claude mcp add --scope user cleanmcp -- cleanmcp mcp
 ```
 
-Claude Desktop / other clients (`mcpServers` config):
-
-```json
-{ "mcpServers": { "cleanmcp": { "command": "cleanmcp", "args": ["mcp"] } } }
-```
+Setup for Claude Desktop, VS Code and Cursor: [docs/mcp-setup.md](docs/mcp-setup.md).
 
 ## Building
 

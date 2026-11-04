@@ -46,7 +46,7 @@ The CLI and MCP server both call `cleanmcp-core`, so their answers always match.
 - `cleanmcp suggest [PATH] [--min-size SIZE] [--json]`
 - `cleanmcp age|dupes|drives|rules|export|snapshot|diff` (Milestone 2)
 - `cleanmcp ui` interactive browser with delete-to-trash (Milestone 3)
-- `cleanmcp mcp` with read-only tools: `scan_directory`, `list_children`, `largest_files`, `extension_breakdown`, `find_cleanup_candidates`
+- `cleanmcp mcp [--root DIR] [--allow-delete] [--http ADDR]` with 8 read-only tools and an opt-in `move_to_trash` (Milestone 4)
 - Unit tests for size roll-up and rule matching; CI on Windows + Linux
 
 ## Roadmap
@@ -76,14 +76,15 @@ The CLI and MCP server both call `cleanmcp-core`, so their answers always match.
 - [x] Protected paths (drive roots, your home folder and its parents, system folders) are refused by a shared check in `cleanmcp-core::safety`
 
 ### Milestone 4: MCP for agents
-- [ ] Resources: expose the last scan summary as an MCP resource
-- [ ] Progress notifications during long scans
-- [ ] Pagination (`offset`/`cursor`) for big result lists; keep responses small by default
-- [ ] `list_drives`, `age_breakdown`, `find_duplicates` tools
-- [ ] Optional allow-list of scan roots (`cleanmcp mcp --root C:\Users\me`) so an agent cannot read the whole disk
-- [ ] Opt-in destructive tool `move_to_trash` only when started with `--allow-delete`; marked `destructive_hint`, requires paths to come from a previous candidates result, logs every action, and refuses system paths
-- [ ] Streamable HTTP transport (optional, for remote use)
-- [ ] Setup docs for Claude Code, Claude Desktop, VS Code, Cursor
+- [x] Resource `cleanmcp://scans` with the scans cached in the session
+- [x] Progress notifications during `scan_directory` (when the client sends a progress token); cancellation stops the scan
+- [x] Pagination (`offset` + `next_offset`) on `list_children`, `largest_files`, `find_cleanup_candidates`; small defaults and hard caps
+- [x] New tools: `list_drives`, `age_breakdown`, `find_duplicates`; `largest_files` gained size/age/extension filters
+- [x] `--root DIR` allow-list (paths resolved first, so `..` and links cannot escape)
+- [x] Opt-in `move_to_trash` (`--allow-delete`): marked destructive, only accepts paths shown earlier in the session, refuses protected paths, logs every attempt to `deletions.log`; the tool is not even listed without the flag
+- [x] Streamable HTTP transport (`--http ADDR`); localhost Host-header check against DNS rebinding
+- [x] Setup docs for Claude Code, Claude Desktop, VS Code, Cursor (`docs/mcp-setup.md`)
+- [x] End-to-end tests drive the real binary with the rmcp client (`crates/cleanmcp/tests/mcp_stdio.rs`)
 
 ### Milestone 5: distribution
 - [ ] Release workflow: build `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`; attach zips/tarballs to GitHub releases

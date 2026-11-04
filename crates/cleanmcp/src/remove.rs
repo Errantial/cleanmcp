@@ -39,6 +39,21 @@ pub fn deletion_target(path: &Path) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+fn send_to_trash(target: &Path) -> Result<(), String> {
+    // Debug builds only: tests set CLEANMCP_TEST_TRASH_DIR so end-to-end runs do not
+    // fill the real Recycle Bin. Release builds always use the real trash.
+    #[cfg(debug_assertions)]
+    if let Some(dir) = std::env::var_os("CLEANMCP_TEST_TRASH_DIR") {
+        let name = target.file_name().ok_or("no file name")?;
+        let dest = Path::new(&dir).join(name);
+        if dest.symlink_metadata().is_ok() {
+            return Err(format!("test trash already has {}", dest.display()));
+        }
+        return std::fs::rename(target, dest).map_err(|e| e.to_string());
+    }
+    trash::delete(target).map_err(|e| e.to_string())
+}
+
 fn trash_one(path: &Path) -> Removal {
     let fail = |e: String| Removal {
         path: path.to_path_buf(),
@@ -52,13 +67,13 @@ fn trash_one(path: &Path) -> Removal {
     if let Some(reason) = protection_reason(&target) {
         return fail(format!("refused: {reason}"));
     }
-    match trash::delete(&target) {
+    match send_to_trash(&target) {
         Ok(()) => Removal {
             path: path.to_path_buf(),
             ok: true,
             error: None,
         },
-        Err(e) => fail(e.to_string()),
+        Err(e) => fail(e),
     }
 }
 

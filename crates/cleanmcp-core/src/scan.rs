@@ -143,7 +143,8 @@ fn build_globs(patterns: &[String]) -> io::Result<Option<GlobSet>> {
     b.build().map(Some).map_err(invalid)
 }
 
-pub(crate) fn unix_now() -> i64 {
+/// Current time as Unix seconds.
+pub fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

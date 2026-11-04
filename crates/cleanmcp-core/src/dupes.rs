@@ -43,17 +43,24 @@ impl Default for DupeOptions {
 /// Files that cannot be read are skipped. On Windows, hard links show up as
 /// duplicates unless the scan used `dedupe_hardlinks`.
 pub fn find_duplicates(root: &Node, base: &Path, opts: &DupeOptions) -> Vec<DuplicateGroup> {
-    // 1. Group by size (cheap, from the scan).
+    hash_candidates(same_size_files(root, base, opts))
+}
+
+/// Files of equal size, the cheap first step of [`find_duplicates`]. Only this
+/// step needs the scan tree, so callers can release locks before hashing.
+pub fn same_size_files(root: &Node, base: &Path, opts: &DupeOptions) -> Vec<(u64, Vec<PathBuf>)> {
     let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
     root.walk(base, &mut |p, n| {
         if n.kind == NodeKind::File && n.size >= opts.min_size.max(1) {
             by_size.entry(n.size).or_default().push(p.to_path_buf());
         }
     });
-    let candidates: Vec<(u64, Vec<PathBuf>)> =
-        by_size.into_iter().filter(|(_, v)| v.len() > 1).collect();
+    by_size.into_iter().filter(|(_, v)| v.len() > 1).collect()
+}
 
-    // 2. Partial hash (head + tail), then 3. full hash, both in parallel.
+/// Hash same-size files (head/tail first, then fully) and return the real duplicates.
+pub fn hash_candidates(candidates: Vec<(u64, Vec<PathBuf>)>) -> Vec<DuplicateGroup> {
+    // Partial hash (head + tail), then 3. full hash, both in parallel.
     let mut groups: Vec<DuplicateGroup> = candidates
         .into_par_iter()
         .flat_map_iter(|(size, paths)| {
