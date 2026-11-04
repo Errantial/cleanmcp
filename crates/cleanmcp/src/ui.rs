@@ -43,7 +43,19 @@ impl Sort {
             Sort::Name => "name",
         }
     }
+    fn short_label(self) -> &'static str {
+        match self {
+            Sort::Size => "size",
+            Sort::Files => "files",
+            Sort::Age => "age",
+            Sort::Name => "name",
+        }
+    }
 }
+
+/// Below this width the fixed row prefix (~48 cells) leaves too little room for
+/// the name, so rows switch to a filename-first layout with one size column.
+const COMPACT_WIDTH: u16 = 60;
 
 /// Case-insensitive name order, equivalent to comparing `to_lowercase()`
 /// strings but without allocating one per comparison for ASCII names.
@@ -330,9 +342,9 @@ impl App {
         ])
         .areas(f.area());
 
+        let compact = f.area().width < COMPACT_WIDTH;
         // Build rows only for the visible window: folders can hold 100k+ entries.
         let height = body.height.saturating_sub(2) as usize;
-        self.page = height.max(1);
         self.page = height.max(1);
         let sel = self.list.selected().unwrap_or(0);
         if sel < self.offset {
@@ -350,39 +362,50 @@ impl App {
             SizeMode::Disk => "on disk",
             SizeMode::Apparent => "apparent",
         };
-        let mut meta = format!(
-            "{} {mode} · {} files · {} dirs · sorted by {}",
-            human(total),
-            node.file_count(),
-            node.dir_count(),
-            self.sort.label()
-        );
+        let mut meta = if compact {
+            format!(
+                "{} {mode} · {} files · {}",
+                human(total),
+                node.file_count(),
+                self.sort.short_label()
+            )
+        } else {
+            format!(
+                "{} {mode} · {} files · {} dirs · sorted by {}",
+                human(total),
+                node.file_count(),
+                node.dir_count(),
+                self.sort.label()
+            )
+        };
         if node.errors() > 0 {
             meta.push_str(&format!(" · {} unreadable", node.errors()));
         }
+        // Keep the folder name visible: the informative part of a path is its tail.
+        let path = self.current_path().display().to_string();
         let head = vec![
             Line::from(vec![Span::styled(
-                self.current_path().display().to_string(),
+                elide_left(&path, header.width as usize),
                 Style::new().bold(),
             )]),
-            Line::from(meta).dark_gray(),
+            Line::from(if compact {
+                truncate_right(&meta, header.width as usize)
+            } else {
+                meta
+            })
+            .dark_gray(),
         ];
         f.render_widget(Paragraph::new(head), header);
 
         let base = self.current_path();
+        let row_width = body.width as usize;
         let window = self.view.iter().skip(self.offset).take(height.max(1));
         let items: Vec<ListItem> = window
             .map(|&i| {
                 let c = &node.children()[i];
                 let size = c.size_by(self.mode);
                 let share = pct(size, total);
-                let filled = ((share / 10.0).round() as usize).min(10);
-                let bar = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
                 let marked = self.marked.contains(&base.join(c.name.as_str()));
-                let age = c
-                    .age()
-                    .map(|a| format!("{}d", a.as_secs() / 86_400))
-                    .unwrap_or_default();
                 let (name, style) = match c.kind() {
                     NodeKind::Dir => (
                         format!("{}/", c.name),
@@ -391,11 +414,33 @@ impl App {
                     NodeKind::Link => (format!("{} ->", c.name), Style::new().fg(Color::Cyan)),
                     _ => (c.name.to_string(), Style::new()),
                 };
+                let marker = if marked { "▸ " } else { "  " };
+                if compact {
+                    // Name first, then one right-aligned size/percent column.
+                    let right = format!("{:>10} {:>4.0}%", human(size), share);
+                    let mut spans = vec![Span::styled(marker, Style::new().fg(Color::Yellow))];
+                    if let Some(avail) = row_width.checked_sub(3 + right.chars().count()) {
+                        let name = truncate_right(&name, avail);
+                        let pad = avail.saturating_sub(name.chars().count());
+                        spans.push(Span::styled(format!("{name}{} ", " ".repeat(pad)), style));
+                        spans.push(Span::raw(right));
+                    } else {
+                        // Too narrow even for the size column: show the name only.
+                        spans.push(Span::styled(
+                            truncate_right(&name, row_width.saturating_sub(2)),
+                            style,
+                        ));
+                    }
+                    return ListItem::new(Line::from(spans));
+                }
+                let filled = ((share / 10.0).round() as usize).min(10);
+                let bar = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
+                let age = c
+                    .age()
+                    .map(|a| format!("{}d", a.as_secs() / 86_400))
+                    .unwrap_or_default();
                 ListItem::new(Line::from(vec![
-                    Span::styled(
-                        if marked { "▸ " } else { "  " },
-                        Style::new().fg(Color::Yellow),
-                    ),
+                    Span::styled(marker, Style::new().fg(Color::Yellow)),
                     Span::raw(format!("{:>10} ", human(size))),
                     Span::styled(bar, Style::new().fg(Color::Green)),
                     Span::raw(format!(" {share:>5.1}% {:>8} {age:>6}  ", c.file_count())),
@@ -423,19 +468,9 @@ impl App {
                 human(self.marked_size())
             )
         };
-        // Most detailed hint line that fits the terminal; the shortest keeps
-        // "? help" and "q quit" discoverable on narrow windows.
-        let full = "↑↓ move  ⏎/→ open  ←/⌫ up  space mark  d trash  o reveal  s sort  a size mode  ? help  q quit";
-        let mid = "↑↓ move  ⏎/→ open  ←/⌫ up  space mark  u clear  d trash  s sort  ? help  q quit";
-        let short = "↑↓ move  ⏎ open  ⌫ up  space mark  u clear  d trash  ? help  q quit";
-        let width = footer.width as usize;
-        let hints = [full, mid, short]
-            .into_iter()
-            .find(|h| h.chars().count() <= width)
-            .unwrap_or(short);
         let foot = vec![
             Line::from(format!("{marked}{}", self.status)),
-            Line::from(hints).dark_gray(),
+            Line::from(hint_line(footer.width)).dark_gray(),
         ];
         f.render_widget(Paragraph::new(foot), footer);
 
@@ -475,19 +510,17 @@ impl App {
             lines.push(Line::from("y = yes, any other key = cancel").dark_gray());
             popup(f, "Confirm", lines);
         } else if self.help {
-            let lines = [
-                "↑/↓ j/k        move          PgUp/PgDn, g/G  jump",
-                "Enter/→/l      open folder   ←/Backspace/h   go up",
-                "space          mark/unmark   u               clear marks",
-                "d / Delete     move marked (or selected) items to the trash",
-                "o              show in Explorer / file manager",
-                "s              sort: size, files, age, name",
-                "a              size on disk / apparent size",
-                "q / Esc        quit",
-                "",
-                "Nothing is deleted permanently. System folders and your home folder are refused.",
-            ];
-            popup(f, "Help", lines.iter().map(|l| Line::from(*l)).collect());
+            let area = f.area();
+            let inner_width = (area.width.saturating_sub(8).min(90)).saturating_sub(2) as usize;
+            let max_height = area.height.saturating_sub(2) as usize;
+            popup(
+                f,
+                "Help",
+                help_text(inner_width, max_height)
+                    .into_iter()
+                    .map(Line::from)
+                    .collect(),
+            );
         }
     }
 }
@@ -495,12 +528,98 @@ impl App {
 /// Shorten `s` to at most `width` characters, keeping the informative tail.
 fn elide_left(s: &str, width: usize) -> String {
     let len = s.chars().count();
-    if len <= width || width == 0 {
+    if len <= width {
         return s.to_string();
     }
-    let keep = width.saturating_sub(1);
+    if width == 0 {
+        return String::new();
+    }
+    let keep = width - 1;
     let tail: String = s.chars().skip(len - keep).collect();
     format!("…{tail}")
+}
+
+/// Shorten `s` to at most `width` characters, keeping the start of the name.
+fn truncate_right(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let head: String = s.chars().take(width - 1).collect();
+    format!("{head}…")
+}
+
+/// Key hints for the footer, most useful first. "? help" and "q quit" are always
+/// kept so both stay reachable on a narrow terminal.
+fn hint_line(width: u16) -> String {
+    const ESSENTIALS: &str = "? help  q quit";
+    const EXTRAS: [&str; 6] = [
+        "↑↓ move",
+        "⏎ open",
+        "space mark",
+        "u clear",
+        "d trash",
+        "⌫ up",
+    ];
+    let width = width as usize;
+    let reserved = 2 + ESSENTIALS.chars().count();
+    let mut hints = String::new();
+    for hint in EXTRAS {
+        let sep = usize::from(!hints.is_empty()) * 2;
+        if hints.chars().count() + sep + hint.chars().count() + reserved <= width {
+            if sep > 0 {
+                hints.push_str("  ");
+            }
+            hints.push_str(hint);
+        }
+    }
+    if hints.is_empty() {
+        ESSENTIALS.to_string()
+    } else {
+        format!("{hints}  {ESSENTIALS}")
+    }
+}
+
+/// Help lines that fit the popup's inner area. A short one-column variant is
+/// used when the two-column layout would wrap or overflow a small terminal.
+fn help_text(width: usize, height: usize) -> Vec<&'static str> {
+    const FULL: [&str; 10] = [
+        "↑/↓ j/k        move          PgUp/PgDn, g/G  jump",
+        "Enter/→/l      open folder   ←/Backspace/h   go up",
+        "space          mark/unmark   u               clear marks",
+        "d / Delete     move marked (or selected) items to the trash",
+        "o              show in Explorer / file manager",
+        "s              sort: size, files, age, name",
+        "a              size on disk / apparent size",
+        "q / Esc        quit",
+        "",
+        "Nothing is deleted permanently. System folders and your home folder are refused.",
+    ];
+    const COMPACT: [&str; 8] = [
+        "↑↓/jk move  PgUp/PgDn jump",
+        "⏎/→ open  ←/⌫ up",
+        "space mark  u clear",
+        "d trash  o reveal",
+        "s sort  a size mode",
+        "q quit  ? close help",
+        "",
+        "Trash only; protected refused.",
+    ];
+    let fits = |lines: &[&'static str]| {
+        lines.len() <= height && lines.iter().all(|l| l.chars().count() <= width)
+    };
+    if fits(&FULL) {
+        return FULL.to_vec();
+    }
+    let mut lines: Vec<&'static str> = COMPACT
+        .into_iter()
+        .filter(|l| l.chars().count() <= width)
+        .collect();
+    lines.truncate(height);
+    lines
 }
 
 fn popup(f: &mut Frame, title: &str, lines: Vec<Line>) {
@@ -737,6 +856,42 @@ mod tests {
         let text = render_text(&mut app, 70, 20);
         assert!(text.contains("q quit"), "quit hint clipped: {text}");
         assert!(text.contains("u clear"), "clear hint missing: {text}");
+    }
+
+    #[test]
+    fn compact_layout_fits_40x10() {
+        let (_dir, mut app) = setup();
+        let text = render_text(&mut app, 40, 10);
+        // The name comes first and the one size/percent column still fits.
+        assert!(text.contains("small.txt"), "filename clipped: {text}");
+        assert!(text.contains("KiB"), "size column missing: {text}");
+        assert!(text.contains('%'), "percent column missing: {text}");
+        assert!(text.contains("q quit"), "quit hint clipped: {text}");
+        // The header path is elided from the left, so its tail survives.
+        assert!(text.contains('…'), "header path not elided: {text}");
+    }
+
+    #[test]
+    fn help_is_readable_at_40x10() {
+        let (_dir, mut app) = setup();
+        app.help = true;
+        let text = render_text(&mut app, 40, 10);
+        assert!(text.contains("space mark"), "help truncated: {text}");
+        assert!(text.contains("q quit"), "help quit hint missing: {text}");
+        assert!(
+            text.contains("Trash only"),
+            "help safety note missing: {text}"
+        );
+    }
+
+    #[test]
+    fn small_terminals_do_not_panic() {
+        let (_dir, mut app) = setup();
+        for (w, h) in [(24, 6), (40, 10), (49, 12), (59, 10), (60, 10)] {
+            app.help = w == 40;
+            render_text(&mut app, w, h);
+            app.help = false;
+        }
     }
 
     #[test]
