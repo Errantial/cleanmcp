@@ -301,6 +301,11 @@ fn glob_anchor(pattern: &str) -> Option<(usize, Anchor)> {
             return None;
         }
         if !segment.contains(['*', '?', '[', '{', ']', '}']) {
+            // globset folds case on ASCII only; lowercasing a non-ASCII segment
+            // here would make the pre-check reject paths the glob would match.
+            if !segment.is_ascii() {
+                return None;
+            }
             return Some((depth, Anchor::Exact(segment.to_lowercase())));
         }
         // `prefix*` (one trailing star, no other metacharacters).
@@ -308,6 +313,9 @@ fn glob_anchor(pattern: &str) -> Option<(usize, Anchor)> {
             && !prefix.is_empty()
             && !prefix.contains(['*', '?', '[', '{', ']', '}'])
         {
+            if !prefix.is_ascii() {
+                return None;
+            }
             return Some((depth, Anchor::Prefix(prefix.to_lowercase())));
         }
         // A bare `*` segment: the next component back is one level up.
@@ -662,6 +670,10 @@ mod tests {
         assert!(glob_anchor("**/foo/**").is_none());
         assert!(glob_anchor("**/*").is_none());
         assert!(glob_anchor("**/a[bc]/*").is_none());
+        // A non-ASCII component cannot be pre-checked: globset folds ASCII only,
+        // so lowercasing it would reject a directory the glob matches.
+        assert!(glob_anchor("**/TÉLÉ/*").is_none());
+        assert!(glob_anchor("**/Загрузки/*").is_none());
     }
 
     #[test]

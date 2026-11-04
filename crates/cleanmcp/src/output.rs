@@ -414,7 +414,8 @@ fn export_rows(
     mut row: impl FnMut(&mut Vec<u8>, &Path, &Node),
 ) -> std::io::Result<()> {
     let mut result = Ok(());
-    s.tree.walk(&s.root, &mut |p, n| {
+    let mut path = s.root.clone();
+    s.tree.walk_into(&mut path, &mut |p, n| {
         if result.is_err() || (o.dirs_only && !n.is_dir()) || n.size_by(o.mode) < o.min_size {
             return;
         }

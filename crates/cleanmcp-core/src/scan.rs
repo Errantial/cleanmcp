@@ -78,6 +78,9 @@ struct Ctx<'a> {
     hardlinks: AtomicU64,
     mounts: AtomicU64,
     excluded: AtomicU64,
+    /// Set only where the walk stops before finishing, so `stats.cancelled`
+    /// means "totals are partial", not "someone pressed stop at some point".
+    truncated: AtomicBool,
 }
 
 /// Scan `root` and return the full tree.
@@ -98,6 +101,7 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> io::Result<Scan> {
         hardlinks: AtomicU64::new(0),
         mounts: AtomicU64::new(0),
         excluded: AtomicU64::new(0),
+        truncated: AtomicBool::new(false),
     };
     let name = root.to_string_lossy();
     let mtime = os::meta_mtime(&meta);
@@ -119,7 +123,7 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> io::Result<Scan> {
             hardlinks_deduped: ctx.hardlinks.into_inner(),
             skipped_mounts: ctx.mounts.into_inner(),
             excluded: ctx.excluded.into_inner(),
-            cancelled: opts.control.is_cancelled(),
+            cancelled: ctx.truncated.into_inner(),
         },
         settings: opts.settings(),
     })
@@ -222,6 +226,7 @@ fn scan_dir(ctx: &Ctx, path: &Path, name: CompactString, mtime: u32) -> Node {
         control.bytes.fetch_add(bytes, Relaxed);
     };
     if ctx.opts.control.is_cancelled() {
+        ctx.truncated.store(true, Relaxed);
         flush(entries, bytes);
         return node;
     }

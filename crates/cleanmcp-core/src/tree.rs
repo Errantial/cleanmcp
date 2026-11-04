@@ -250,9 +250,18 @@ impl Node {
 
     /// Depth-first walk over every node, giving each node's full path.
     pub fn walk<'a>(&'a self, base: &Path, f: &mut impl FnMut(&Path, &'a Node)) {
-        f(base, self);
+        let mut path = base.to_path_buf();
+        self.walk_into(&mut path, f);
+    }
+
+    /// Like [`Node::walk`], but reuses one path buffer instead of allocating a
+    /// `PathBuf` per node. `path` must already name this node.
+    pub fn walk_into<'a>(&'a self, path: &mut PathBuf, f: &mut impl FnMut(&Path, &'a Node)) {
+        f(path, self);
         for child in self.children() {
-            child.walk(&base.join(child.name.as_str()), f);
+            path.push(child.name.as_str());
+            child.walk_into(path, f);
+            path.pop();
         }
     }
 
