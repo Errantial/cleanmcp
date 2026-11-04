@@ -11,8 +11,8 @@ provides=('cleanmcp')
 conflicts=('cleanmcp')
 source_x86_64=("$url/releases/download/v$pkgver/cleanmcp-$pkgver-x86_64-unknown-linux-musl.tar.gz")
 source_aarch64=("$url/releases/download/v$pkgver/cleanmcp-$pkgver-aarch64-unknown-linux-musl.tar.gz")
-sha256sums_x86_64=('HASH_X86_64_LINUX')
-sha256sums_aarch64=('HASH_AARCH64_LINUX')
+sha256sums_x86_64=('e36dbb152acca13cc43ba9ebaa4bf5bea008d44219d6dbad9d3bca6e6e0cf8eb')
+sha256sums_aarch64=('1c3eb5fb488adb858b82fdd1c738f75b0c70930150f891131d4ab42a012c7ce7')
 
 package() {
     cd "cleanmcp-$pkgver-$CARCH-unknown-linux-musl"

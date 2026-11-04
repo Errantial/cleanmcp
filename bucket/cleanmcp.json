@@ -6,7 +6,7 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/Errantial/cleanmcp/releases/download/v0.1.0/cleanmcp-0.1.0-x86_64-pc-windows-msvc.zip",
-            "hash": "HASH_X86_64_WINDOWS",
+            "hash": "14fa831ef424d4aa330f09dd43205863db809666db2efedbf4c2ef49c46b53d7",
             "extract_dir": "cleanmcp-0.1.0-x86_64-pc-windows-msvc"
         }
     },
