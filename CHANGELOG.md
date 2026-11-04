@@ -27,7 +27,7 @@ built-in MCP server so AI agents can find what to clean up.
 ### Accuracy and speed
 - Parallel scanner; symlinks and junctions are never followed; hard links counted once;
   OneDrive online-only files count as 0 bytes on disk; compressed and sparse files measured.
-- About 485k entries/s on a warm Windows profile scan, about 100 bytes of memory per entry.
+- About 485k entries/s on a warm Windows profile scan, about 83 bytes of memory per entry.
 
 ### Downloads
 - `x86_64-pc-windows-msvc` (zip), `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`
