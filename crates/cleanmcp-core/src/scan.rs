@@ -453,7 +453,7 @@ mod tests {
         let s = scan(p, &opts()).unwrap();
         assert_eq!(s.tree.size, 10_000);
         assert_eq!(s.stats.hardlinks_deduped, 1);
-        assert_eq!(s.find(Path::new("loop")).unwrap().kind, NodeKind::Link);
+        assert_eq!(s.find(Path::new("loop")).unwrap().kind(), NodeKind::Link);
     }
 
     #[cfg(windows)]
