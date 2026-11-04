@@ -12,7 +12,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 
 use crate::os::{self, FileId, FsInfo};
-use crate::tree::{NO_TIME, Node, NodeKind, Scan, ScanSettings, ScanStats};
+use crate::tree::{Node, NodeKind, Scan, ScanSettings, ScanStats};
 
 /// Live counters and a cancel switch shared with a running scan.
 #[derive(Debug, Default)]
@@ -99,11 +99,16 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> io::Result<Scan> {
         mounts: AtomicU64::new(0),
         excluded: AtomicU64::new(0),
     };
-    let name = CompactString::from(root.to_string_lossy());
+    let name = root.to_string_lossy();
+    let mtime = os::meta_mtime(&meta);
     let tree = if meta.is_dir() {
-        scan_dir(&ctx, &root, name, mtime(&meta))
+        scan_dir(&ctx, &root, CompactString::from(name.as_ref()), mtime)
     } else {
-        file_node(&ctx, &root, name, &meta)
+        let entry = os::FsEntry::from_meta(&name, root.as_os_str(), &meta, mtime);
+        let node = file_node(&ctx, &root, &entry);
+        ctx.opts.control.entries.fetch_add(1, Relaxed);
+        ctx.opts.control.bytes.fetch_add(node.disk_size, Relaxed);
+        node
     };
     Ok(Scan {
         root,
@@ -151,59 +156,66 @@ pub fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-fn mtime(meta: &fs::Metadata) -> i64 {
-    match meta.modified() {
-        Ok(t) => match t.duration_since(UNIX_EPOCH) {
-            Ok(d) => d.as_secs() as i64,
-            Err(e) => -(e.duration().as_secs() as i64),
-        },
-        Err(_) => NO_TIME,
+/// Builds `dir/name` in one reusable buffer, so per-entry paths cost no allocation.
+struct ChildPath {
+    buf: PathBuf,
+    base: usize,
+    pushed: bool,
+}
+
+impl ChildPath {
+    fn new(dir: &Path) -> Self {
+        ChildPath {
+            buf: dir.to_path_buf(),
+            base: dir.as_os_str().len(),
+            pushed: false,
+        }
+    }
+
+    /// Point the buffer at `dir/name`; call [`ChildPath::reset`] before the next entry.
+    fn set(&mut self, e: &os::FsEntry<'_>) -> &Path {
+        e.push_name(&mut self.buf);
+        self.pushed = true;
+        &self.buf
+    }
+
+    fn reset(&mut self) {
+        if self.pushed {
+            // A listing never yields `.`/`..`, so this drops exactly the pushed name.
+            self.buf.pop();
+            debug_assert_eq!(self.buf.as_os_str().len(), self.base);
+            self.pushed = false;
+        }
     }
 }
 
-fn file_node(ctx: &Ctx, path: &Path, name: CompactString, meta: &fs::Metadata) -> Node {
-    let ft = meta.file_type();
-    let kind = if ft.is_symlink() {
-        NodeKind::Link
-    } else if ft.is_file() {
-        NodeKind::File
-    } else {
-        NodeKind::Other
-    };
-    let (mut size, mut disk) = if kind == NodeKind::File {
-        (meta.len(), os::disk_size(path, meta, &ctx.fs))
-    } else {
-        (0, 0)
-    };
-    if kind == NodeKind::File
-        && let Some(id) = os::hardlink_id(path, meta, ctx.opts.dedupe_hardlinks)
-        && !ctx.seen.lock().unwrap().insert(id)
-    {
-        ctx.hardlinks.fetch_add(1, Relaxed);
-        size = 0;
-        disk = 0;
+fn file_node(ctx: &Ctx, path: &Path, e: &os::FsEntry<'_>) -> Node {
+    let kind = e.kind;
+    let (mut size, mut disk) = (e.size, 0);
+    if kind == NodeKind::File {
+        disk = match e.disk_size_known(&ctx.fs) {
+            Some(d) => d,
+            None => os::ask_fs(path).unwrap_or_else(|| e.disk_size_estimate(&ctx.fs)),
+        };
+        if let Some(id) = e.hardlink_id(path, ctx.opts.dedupe_hardlinks)
+            && !ctx.seen.lock().unwrap().insert(id)
+        {
+            ctx.hardlinks.fetch_add(1, Relaxed);
+            size = 0;
+            disk = 0;
+        }
     }
-    ctx.opts.control.entries.fetch_add(1, Relaxed);
-    ctx.opts.control.bytes.fetch_add(disk, Relaxed);
     Node {
-        name,
+        name: CompactString::from(e.name),
         size,
         disk_size: disk,
-        mtime: mtime(meta),
+        mtime: e.mtime,
         file_count: (kind == NodeKind::File) as u32,
         dir_count: 0,
         errors: 0,
         kind,
         children: Box::new([]),
     }
-}
-
-fn is_excluded(ctx: &Ctx, path: &Path, name: &str) -> bool {
-    let Some(set) = &ctx.exclude else {
-        return false;
-    };
-    // globset normalizes `\` to `/` itself on Windows.
-    set.is_match(name) || set.is_match(path)
 }
 
 fn scan_dir(ctx: &Ctx, path: &Path, name: CompactString, mtime: i64) -> Node {
@@ -218,50 +230,60 @@ fn scan_dir(ctx: &Ctx, path: &Path, name: CompactString, mtime: i64) -> Node {
         kind: NodeKind::Dir,
         children: Box::new([]),
     };
-    ctx.opts.control.entries.fetch_add(1, Relaxed);
+    // Progress counters are batched per directory: two atomic updates instead of
+    // two per entry, which keeps 24 threads off the same cache line.
+    let mut entries = 1u64;
+    let mut bytes = 0u64;
+    let flush = |entries: u64, bytes: u64| {
+        let control = &ctx.opts.control;
+        control.entries.fetch_add(entries, Relaxed);
+        control.bytes.fetch_add(bytes, Relaxed);
+    };
     if ctx.opts.control.is_cancelled() {
+        flush(entries, bytes);
         return node;
     }
 
-    let entries = match fs::read_dir(path) {
-        Ok(rd) => rd,
-        Err(_) => {
-            node.errors = 1;
-            return node;
-        }
-    };
-
-    let mut children = Vec::new();
+    let mut children: Vec<Node> = Vec::new();
     let mut subdirs: Vec<(PathBuf, CompactString, i64)> = Vec::new();
-    for entry in entries {
-        let Ok(entry) = entry else {
-            node.errors += 1;
-            continue;
-        };
-        let name = CompactString::from(entry.file_name().to_string_lossy());
-        let child_path = entry.path();
-        if is_excluded(ctx, &child_path, &name) {
-            ctx.excluded.fetch_add(1, Relaxed);
-            continue;
+    let mut scratch = ChildPath::new(path);
+    let mut excluded = 0u64;
+    let mut mounts = 0u64;
+
+    let walked = os::walk_dir(path, &mut |e| {
+        // Reset from the previous entry before appending this one.
+        scratch.reset();
+        let child = scratch.set(e);
+        // globset normalizes `\` to `/` itself on Windows.
+        if let Some(set) = &ctx.exclude
+            && (set.is_match(e.name) || set.is_match(child))
+        {
+            excluded += 1;
+            return;
         }
-        // DirEntry::metadata does not follow links. On Windows it is free (it comes
-        // from the directory listing); on Unix it is one lstat.
-        match entry.metadata() {
-            Ok(meta) if meta.is_dir() => {
-                if !ctx.opts.include_virtual && os::is_virtual_fs(&child_path) {
-                    ctx.excluded.fetch_add(1, Relaxed);
-                    continue;
+        match e.kind {
+            NodeKind::Dir => {
+                if !ctx.opts.include_virtual && os::is_virtual_fs(child) {
+                    excluded += 1;
+                    return;
                 }
-                if ctx.opts.one_filesystem && os::device(&meta).is_some_and(|d| d != ctx.fs.device)
-                {
-                    ctx.mounts.fetch_add(1, Relaxed);
-                    continue;
+                if ctx.opts.one_filesystem && e.device().is_some_and(|d| d != ctx.fs.device) {
+                    mounts += 1;
+                    return;
                 }
-                subdirs.push((child_path, name, self::mtime(&meta)));
+                subdirs.push((child.to_path_buf(), CompactString::from(e.name), e.mtime));
             }
-            Ok(meta) => children.push(file_node(ctx, &child_path, name, &meta)),
-            Err(_) => node.errors += 1,
+            _ => {
+                let n = file_node(ctx, child, e);
+                entries += 1;
+                bytes += n.disk_size;
+                children.push(n);
+            }
         }
+    });
+    match walked {
+        Ok(errs) => node.errors += errs as u32,
+        Err(_) => node.errors += 1,
     }
 
     // Recurse into subdirectories in parallel.
@@ -272,6 +294,9 @@ fn scan_dir(ctx: &Ctx, path: &Path, name: CompactString, mtime: i64) -> Node {
     children.extend(dirs);
     node.children = children.into_boxed_slice();
     node.finish_dir();
+    ctx.excluded.fetch_add(excluded, Relaxed);
+    ctx.mounts.fetch_add(mounts, Relaxed);
+    flush(entries, bytes);
     node
 }
 
@@ -384,6 +409,55 @@ mod tests {
         o.control.cancel();
         let s = scan(dir.path(), &o).unwrap();
         assert!(s.stats.cancelled);
+    }
+
+    #[test]
+    fn many_entries_in_one_directory() {
+        // More entries than a single directory-listing buffer holds.
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        fs::create_dir(&big).unwrap();
+        for i in 0..800 {
+            let name = format!("{i:03}-{}", "x".repeat(60));
+            fs::write(big.join(name), vec![1u8; 100]).unwrap();
+        }
+        let s = scan(dir.path(), &opts()).unwrap();
+        assert_eq!(s.tree.file_count, 800);
+        assert_eq!(s.tree.size, 80_000);
+        let big = s.find(Path::new("big")).unwrap();
+        assert_eq!(big.file_count, 800);
+        assert_eq!(big.children.len(), 800);
+    }
+
+    #[test]
+    fn unicode_and_long_names() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("héllo wörld — ünïcode.txt"), b"hi").unwrap();
+        fs::write(dir.path().join("😀 emoji.txt"), b"hey").unwrap();
+        fs::write(dir.path().join("n".repeat(200)), b"x").unwrap();
+        let s = scan(dir.path(), &opts()).unwrap();
+        assert_eq!(s.tree.file_count, 3);
+        assert_eq!(s.tree.size, 6);
+        assert!(s.find(Path::new("héllo wörld — ünïcode.txt")).is_some());
+        assert!(s.find(Path::new("😀 emoji.txt")).is_some());
+        assert!(s.find(Path::new(&"n".repeat(200))).is_some());
+    }
+
+    #[test]
+    fn paths_longer_than_max_path() {
+        // Windows only limits paths that are not given the `\\?\` prefix.
+        let dir = tempfile::tempdir().unwrap();
+        let mut deep = dir.path().to_path_buf();
+        for i in 0..6 {
+            deep.push(format!("{i:02}-{}", "d".repeat(40)));
+        }
+        assert!(deep.as_os_str().len() > 260, "{}", deep.display());
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("file.txt"), b"12345").unwrap();
+        let s = scan(dir.path(), &opts()).unwrap();
+        assert_eq!(s.tree.file_count, 1);
+        assert_eq!(s.tree.size, 5);
+        assert_eq!(s.tree.dir_count, 6);
     }
 
     #[cfg(unix)]
