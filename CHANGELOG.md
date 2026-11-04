@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.0 - 2026-11-04
+
+Agent-facing improvements: every MCP read tool can now report apparent (logical) sizes, and two
+new tools let an agent snapshot a folder and diff it later. No breaking changes; the snapshot
+format is unchanged.
+
+### MCP server
+- New `save_snapshot` tool: scan a folder and write a snapshot file (`.gz` = compressed) for later
+  comparison. The output file must be inside the server's `--root` folders, and the parent folder
+  is what gets root-checked (the file itself does not exist yet).
+- New `diff_snapshots` tool: compare a snapshot with a newer snapshot, a folder scanned now, or the
+  snapshot's own root rescanned. Reports what grew or shrank, largest absolute change first. The
+  "scan now" side always rescans, so a cached scan from an earlier tool call cannot make a diff
+  report nothing changed.
+- `scan_directory`, `list_children`, `largest_files`, `extension_breakdown`,
+  `find_cleanup_candidates` and `find_duplicates` take an optional `apparent` flag to report and
+  sort by logical file sizes instead of space used on disk (matching the CLI's `--apparent`).
+  `find_duplicates` prices wasted space in the selected mode.
+
 ## 0.3.0 - 2026-11-04
 
 Security hardening, more honest JSON, a layout for narrow terminals, and faster diffs. The one

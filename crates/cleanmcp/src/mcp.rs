@@ -18,6 +18,7 @@ use cleanmcp_core::drives::{self, Drive};
 use cleanmcp_core::dupes::{self, DuplicateGroup};
 use cleanmcp_core::query::{self, AgeStat, Entry, ExtensionStat, FileFilter, format_time};
 use cleanmcp_core::rules::{self, Candidate, RuleSet};
+use cleanmcp_core::snapshot::{self, DiffNode};
 use cleanmcp_core::tree::{is_within, path_key, same_path};
 use cleanmcp_core::{Node, Scan, ScanOptions, SizeMode};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -162,6 +163,8 @@ pub struct ScanParams {
     /// Linux: do not cross into other mounted filesystems.
     #[serde(default)]
     pub one_filesystem: bool,
+    /// Report logical file sizes instead of space used on disk.
+    pub apparent: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -179,6 +182,8 @@ pub struct ChildrenParams {
     pub top: Option<usize>,
     /// Skip this many children at the first level (pagination).
     pub offset: Option<usize>,
+    /// Report logical file sizes instead of space used on disk.
+    pub apparent: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -197,6 +202,8 @@ pub struct FilesParams {
     /// Only these extensions, e.g. ["iso", "zip"].
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// Report logical file sizes instead of space used on disk.
+    pub apparent: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -204,6 +211,8 @@ pub struct TopParams {
     pub path: String,
     /// How many rows (default 25).
     pub top: Option<usize>,
+    /// Report logical file sizes instead of space used on disk.
+    pub apparent: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -215,6 +224,8 @@ pub struct SuggestParams {
     pub top: Option<usize>,
     /// Skip this many results (pagination).
     pub offset: Option<usize>,
+    /// Report logical file sizes instead of space used on disk.
+    pub apparent: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -226,6 +237,35 @@ pub struct DupesParams {
     pub top: Option<usize>,
     /// Skip this many groups (pagination). Each page re-hashes the files.
     pub offset: Option<usize>,
+    /// Price wasted space by logical size instead of space used on disk.
+    pub apparent: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SnapshotParams {
+    /// Folder or drive to scan.
+    pub path: String,
+    /// File to write the snapshot to (`.gz` = compressed). Must be inside the
+    /// folders this server may access.
+    pub output: String,
+    /// Rescan even if a cached scan covers this path.
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DiffParams {
+    /// Snapshot file written by `save_snapshot` (or `cleanmcp snapshot`).
+    pub old: String,
+    /// Newer snapshot file, or a folder to scan now. Default: rescan the old
+    /// snapshot's root.
+    pub new: Option<String>,
+    /// Levels to expand (default 3, max 6).
+    pub depth: Option<usize>,
+    /// Changed children per folder (default 10).
+    pub top: Option<usize>,
+    /// Report logical file sizes instead of space used on disk.
+    pub apparent: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -316,6 +356,26 @@ pub struct DupesResult {
 }
 
 #[derive(Serialize, JsonSchema)]
+pub struct SnapshotResult {
+    pub output: PathBuf,
+    pub root: PathBuf,
+    pub entries: u64,
+    pub disk_size: u64,
+    pub disk_size_human: String,
+    pub scanned_at_utc: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct DiffResult {
+    pub old_root: PathBuf,
+    pub new_root: PathBuf,
+    pub old_scanned_at_utc: String,
+    pub new_scanned_at_utc: String,
+    /// What grew or shrank, largest absolute change first.
+    pub changes: DiffNode,
+}
+
+#[derive(Serialize, JsonSchema)]
 pub struct TrashResult {
     pub results: Vec<Removal>,
     pub freed_disk_size: u64,
@@ -342,6 +402,13 @@ fn bounded_top(depth: usize, top: usize) -> usize {
 
 fn mib(v: Option<u64>, default: u64) -> u64 {
     v.unwrap_or(default).saturating_mul(1024 * 1024)
+}
+
+fn mode(apparent: Option<bool>) -> SizeMode {
+    match apparent {
+        Some(true) => SizeMode::Apparent,
+        _ => SizeMode::Disk,
+    }
 }
 
 /// Reject requests that would make the server do an unbounded amount of work:
@@ -462,16 +529,17 @@ impl CleanMcp {
             .get_scan(&p.path, p.refresh, p.one_filesystem, true, progress, ct)
             .await?;
         let abs = self.absolute(&p.path)?;
+        let size_mode = mode(p.apparent);
         let s = scan.read().unwrap();
         // A cached scan of a parent folder may have answered; report the folder asked for.
         let t = find(&s, &abs)?;
-        let top_children = t
-            .children()
+        let sorted = t.sorted_children(size_mode);
+        let top_children = sorted
             .iter()
             .take(15)
             .map(|c| Entry::from_node(&abs.join(c.name.as_str()), c))
             .collect::<Vec<_>>();
-        let other = &t.children()[top_children.len().min(t.children().len())..];
+        let other = &sorted[top_children.len().min(sorted.len())..];
         self.remember(top_children.iter().map(|e| &e.path));
         Ok(Json(ScanSummary {
             root: abs.clone(),
@@ -490,7 +558,7 @@ impl CleanMcp {
             scanned_at_utc: format_time(s.scanned_at),
             top_children,
             other_children_count: other.len(),
-            other_children_disk_size: other.iter().map(|c| c.disk_size).sum(),
+            other_children_disk_size: other.iter().map(|c| c.size_by(size_mode)).sum(),
         }))
     }
 
@@ -508,6 +576,7 @@ impl CleanMcp {
         let depth = p.depth.unwrap_or(1).clamp(1, 4);
         let top = bounded_top(depth, p.top.unwrap_or(20).min(200));
         let offset = p.offset.unwrap_or(0);
+        let size_mode = mode(p.apparent);
         // Building the JSON for a big folder can take a while: keep it off the
         // async workers (and hold the scan lock only inside this blocking task).
         let tree = {
@@ -521,7 +590,7 @@ impl CleanMcp {
                     depth,
                     top,
                     offset,
-                    SizeMode::Disk,
+                    size_mode,
                 ))
             })
             .await
@@ -547,6 +616,7 @@ impl CleanMcp {
         let (path, scan) = self.resolve(&p.path, ct).await?;
         let top = p.top.unwrap_or(25).min(500);
         let offset = p.offset.unwrap_or(0).min(MAX_OFFSET);
+        let size_mode = mode(p.apparent);
         let filter = FileFilter {
             min_size: p.min_size_mib.map(|m| m.saturating_mul(1024 * 1024)),
             older_than_days: p.older_than_days,
@@ -563,7 +633,7 @@ impl CleanMcp {
                 &path,
                 wanted,
                 &filter,
-                SizeMode::Disk,
+                size_mode,
             ))
         })
         .await
@@ -584,10 +654,11 @@ impl CleanMcp {
     ) -> Result<Json<ExtResult>, String> {
         let (path, scan) = self.resolve(&p.path, ct).await?;
         let top = p.top.unwrap_or(25).min(500);
+        let size_mode = mode(p.apparent);
         let extensions = tokio::task::spawn_blocking(move || {
             let s = scan.read().unwrap();
             let node = find(&s, &path)?;
-            Ok::<_, String>(query::by_extension(node, top, SizeMode::Disk))
+            Ok::<_, String>(query::by_extension(node, top, size_mode))
         })
         .await
         .map_err(|e| e.to_string())??;
@@ -630,6 +701,7 @@ impl CleanMcp {
         let (path, scan) = self.resolve(&p.path, ct).await?;
         let rules = self.rules.clone();
         let min_size = mib(p.min_size_mib, 10);
+        let size_mode = mode(p.apparent);
         let all = tokio::task::spawn_blocking(move || {
             let s = scan.read().unwrap();
             let node = find(&s, &path)?;
@@ -638,12 +710,12 @@ impl CleanMcp {
                 node,
                 &path,
                 min_size,
-                SizeMode::Disk,
+                size_mode,
             ))
         })
         .await
         .map_err(|e| e.to_string())??;
-        let total_disk_size = all.iter().map(|c| c.entry.disk_size).sum();
+        let total_disk_size = all.iter().map(|c| c.entry.size_by(size_mode)).sum();
         let total_count = all.len();
         let (candidates, next_offset) = page(
             all,
@@ -676,6 +748,7 @@ impl CleanMcp {
         let min_size = mib(p.min_size_mib, 1).max(1);
         let top = p.top.unwrap_or(20).min(200);
         let offset = p.offset.unwrap_or(0).min(MAX_OFFSET);
+        let size_mode = mode(p.apparent);
         let groups = tokio::task::spawn_blocking(move || {
             // Hold the scan lock only while listing files, not while reading them.
             let same_size = {
@@ -687,7 +760,13 @@ impl CleanMcp {
         })
         .await
         .map_err(|e| e.to_string())??;
-        let total_wasted: u64 = groups.iter().map(|g| g.wasted).sum();
+        let mut groups = groups;
+        groups.sort_unstable_by(|a, b| {
+            b.wasted_by(size_mode)
+                .cmp(&a.wasted_by(size_mode))
+                .then_with(|| a.paths.cmp(&b.paths))
+        });
+        let total_wasted: u64 = groups.iter().map(|g| g.wasted_by(size_mode)).sum();
         let total_groups = groups.len();
         let (groups, next_offset) = page(groups, offset, top);
         self.remember(groups.iter().flat_map(|g| &g.paths));
@@ -697,6 +776,163 @@ impl CleanMcp {
             total_groups,
             groups,
             next_offset,
+        }))
+    }
+
+    #[tool(
+        description = "Scan a folder and save the result to a snapshot file, so it can be compared \
+                       later with `diff_snapshots` (what grew or shrank). The output file must be \
+                       inside the folders this server may access.",
+        annotations(read_only_hint = true)
+    )]
+    async fn save_snapshot(
+        &self,
+        Parameters(p): Parameters<SnapshotParams>,
+        ct: CancellationToken,
+    ) -> Result<Json<SnapshotResult>, String> {
+        // The output file does not exist yet, so canonicalize its parent and
+        // join the file name; that keeps the root check on a real folder.
+        let raw = Path::new(&p.output);
+        if raw.file_name().is_none() {
+            return Err(format!("{} is not a file path", raw.display()));
+        }
+        let parent = self.absolute(&raw.parent().unwrap_or(Path::new(".")).to_string_lossy())?;
+        let out = parent.join(raw.file_name().unwrap());
+        if out.is_dir() {
+            return Err(format!(
+                "{} is a directory, not a snapshot file",
+                out.display()
+            ));
+        }
+        let scan = self
+            .get_scan(&p.path, p.refresh, false, false, None, ct)
+            .await?;
+        let result = tokio::task::spawn_blocking(move || {
+            let s = scan.read().unwrap();
+            snapshot::save(&s, &out).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+            Ok::<_, String>(SnapshotResult {
+                entries: s.tree.file_count() as u64 + s.tree.dir_count() as u64,
+                disk_size: s.tree.disk_size,
+                disk_size_human: human(s.tree.disk_size),
+                scanned_at_utc: format_time(s.scanned_at),
+                root: s.root.clone(),
+                output: out,
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(Json(result))
+    }
+
+    #[tool(
+        description = "Compare a snapshot with a newer snapshot (or a folder scanned now, or the \
+                       snapshot's own root rescanned) and report what grew or shrank, largest \
+                       absolute change first.",
+        annotations(read_only_hint = true)
+    )]
+    async fn diff_snapshots(
+        &self,
+        Parameters(p): Parameters<DiffParams>,
+        ct: CancellationToken,
+    ) -> Result<Json<DiffResult>, String> {
+        let old_path = self.absolute(&p.old)?;
+        if old_path.is_dir() {
+            return Err(format!(
+                "{} is a directory, not a snapshot file",
+                old_path.display()
+            ));
+        }
+        let depth = p.depth.unwrap_or(3).clamp(1, 6);
+        let top = p.top.unwrap_or(10).min(200);
+        let size_mode = mode(p.apparent);
+        let header = snapshot::read_header(&old_path)
+            .map_err(|e| format!("cannot read {}: {e}", old_path.display()))?;
+        let (old_scan, new_scan) = match &p.new {
+            Some(n) => {
+                let new_path = self.absolute(n)?;
+                if new_path.is_file() {
+                    let o = snapshot::load_truncated(&old_path, depth)
+                        .map_err(|e| format!("cannot read {}: {e}", old_path.display()))?;
+                    let n = snapshot::load_truncated(&new_path, depth)
+                        .map_err(|e| format!("cannot read {}: {e}", new_path.display()))?;
+                    (o, n)
+                } else if new_path.is_dir() {
+                    let o = snapshot::load_truncated(&old_path, depth)
+                        .map_err(|e| format!("cannot read {}: {e}", old_path.display()))?;
+                    let n = self
+                        .get_scan(n, true, false, false, None, ct)
+                        .await?;
+                    let sub = {
+                        let n = n.read().unwrap();
+                        // The cached scan may cover a parent; diff against the asked folder.
+                        let node = find(&n, &new_path)?;
+                        Scan {
+                            root: new_path,
+                            tree: node.clone(),
+                            scanned_at: n.scanned_at,
+                            started_at: n.started_at,
+                            elapsed_ms: n.elapsed_ms,
+                            stats: n.stats.clone(),
+                            settings: n.settings.clone(),
+                        }
+                    };
+                    (o, sub)
+                } else {
+                    return Err(format!(
+                        "{} is not a snapshot file or directory",
+                        new_path.display()
+                    ));
+                }
+            }
+            None => {
+                let root = header.root.clone();
+                if !root.is_dir() {
+                    return Err(format!(
+                        "the snapshot's root {} no longer exists; pass `new` explicitly",
+                        root.display()
+                    ));
+                }
+                let o = snapshot::load_truncated(&old_path, depth)
+                    .map_err(|e| format!("cannot read {}: {e}", old_path.display()))?;
+                let n = self
+                    .get_scan(&root.to_string_lossy(), true, false, false, None, ct)
+                    .await?;
+                let sub = {
+                    let n = n.read().unwrap();
+                    let node = find(&n, &root)?;
+                    Scan {
+                        root,
+                        tree: node.clone(),
+                        scanned_at: n.scanned_at,
+                        started_at: n.started_at,
+                        elapsed_ms: n.elapsed_ms,
+                        stats: n.stats.clone(),
+                        settings: n.settings.clone(),
+                    }
+                };
+                (o, sub)
+            }
+        };
+        let new_root = new_scan.root.clone();
+        let diff_base = new_root.clone();
+        let changes = tokio::task::spawn_blocking(move || {
+            snapshot::diff(
+                &old_scan.tree,
+                &new_scan.tree,
+                &diff_base,
+                depth,
+                top,
+                size_mode,
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(Json(DiffResult {
+            old_root: old_scan.root.clone(),
+            new_root,
+            old_scanned_at_utc: format_time(old_scan.scanned_at),
+            new_scanned_at_utc: format_time(new_scan.scanned_at),
+            changes,
         }))
     }
 
@@ -1141,6 +1377,28 @@ mod tests {
         )
         .unwrap();
         assert!(rw.tool_router.has_route("move_to_trash"));
+    }
+
+    #[test]
+    fn snapshot_tools_are_registered_read_only() {
+        let ro = CleanMcp::new(Config::default(), &McpOptions::default()).unwrap();
+        for name in ["save_snapshot", "diff_snapshots"] {
+            let all = ro.tool_router.list_all();
+            let t = all
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} not registered"));
+            assert_eq!(
+                t.annotations.as_ref().and_then(|a| a.read_only_hint),
+                Some(true),
+                "{name} must stay read-only"
+            );
+        }
+        // The apparent-size option deserializes on every tool that has it.
+        let p: FilesParams = serde_json::from_str(r#"{"path": "/tmp", "apparent": true}"#).unwrap();
+        assert_eq!(mode(p.apparent), SizeMode::Apparent);
+        let p: DupesParams = serde_json::from_str(r#"{"path": "/tmp"}"#).unwrap();
+        assert_eq!(mode(p.apparent), SizeMode::Disk);
     }
 
     #[test]

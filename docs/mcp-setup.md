@@ -86,13 +86,15 @@ Point any client that supports Streamable HTTP at `http://127.0.0.1:8765/mcp`.
 | Tool | What it does |
 |---|---|
 | `list_drives` | Volumes with total / used / free space (not limited by `--root`) |
-| `scan_directory` | Scan a folder or drive (cached), returning totals plus the largest 15 direct children and counts for the rest; `refresh`, `one_filesystem`; reports progress when the client supplies a progress token, and can be cancelled |
-| `list_children` | Drill into a folder, largest first; `depth` 1-4, `top` (default 20, max 200; lowered when `depth > 1`), `offset` for the first level; `other_count` / `other_disk_size` report what is left |
-| `largest_files` | Biggest files with `min_size_mib`, `older_than_days`, `newer_than_days`, `extensions`; `top` (default 25, max 500); `next_offset` for pagination |
-| `extension_breakdown` | Usage per file type; `top` (default 25, max 500) |
+| `scan_directory` | Scan a folder or drive (cached), returning totals plus the largest 15 direct children and counts for the rest; `refresh`, `one_filesystem`, `apparent`; reports progress when the client supplies a progress token, and can be cancelled |
+| `list_children` | Drill into a folder, largest first; `depth` 1-4, `top` (default 20, max 200; lowered when `depth > 1`), `offset` for the first level, `apparent`; `other_count` / `other_disk_size` report what is left |
+| `largest_files` | Biggest files with `min_size_mib`, `older_than_days`, `newer_than_days`, `extensions`, `apparent`; `top` (default 25, max 500); `next_offset` for pagination |
+| `extension_breakdown` | Usage per file type; `top` (default 25, max 500), `apparent` |
 | `age_breakdown` | Usage by last-modified age, including an `unknown` bucket |
-| `find_cleanup_candidates` | Folders that are usually safe to remove, with safety level, reason and cleanup command; `min_size_mib` (default 10), `top` (default 30, max 500); `next_offset` |
-| `find_duplicates` | Identical files, most wasted space first; `min_size_mib` (default 1), `top` (default 20, max 200), `offset`; `next_offset`; each page re-hashes the candidates |
+| `find_cleanup_candidates` | Folders that are usually safe to remove, with safety level, reason and cleanup command; `min_size_mib` (default 10), `top` (default 30, max 500), `apparent`; `next_offset` |
+| `find_duplicates` | Identical files, most wasted space first; `min_size_mib` (default 1), `top` (default 20, max 200), `offset`, `apparent`; `next_offset`; each page re-hashes the candidates |
+| `save_snapshot` | Scan a folder and write a snapshot file (`.gz` = compressed) inside the `--root` folders, for later comparison |
+| `diff_snapshots` | Compare a snapshot with a newer snapshot, a folder scanned now, or the snapshot's own root rescanned; `depth` (default 3, max 6), `top`, `apparent`; largest absolute change first |
 | `move_to_trash` | Only with `--allow-delete`; `paths` and an optional `reason`; see above |
 
 Resource: `cleanmcp://scans` lists the scans cached by the server process (up to four; over HTTP the
