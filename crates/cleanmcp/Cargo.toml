@@ -1,0 +1,24 @@
+[package]
+name = "cleanmcp"
+description = "TreeSize-style disk usage CLI with a built-in MCP server for AI agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cleanmcp"
+path = "src/main.rs"
+
+[dependencies]
+cleanmcp-core.workspace = true
+anyhow.workspace = true
+bytesize.workspace = true
+clap.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

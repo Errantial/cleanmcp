@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cleanmcp-dev": {
+      "command": "cargo",
+      "args": ["run", "-q", "--", "mcp"]
+    }
+  }
+}

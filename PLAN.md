@@ -1,0 +1,101 @@
+# CleanMCP development plan
+
+## Goal
+
+One cross-platform binary (`cleanmcp`) for Windows and Linux that:
+
+1. **Works like TreeSize in the terminal:** fast parallel scan, size tree sorted largest-first, largest files, per-extension breakdown, old-file filters, and later an interactive TUI.
+2. **Has a built-in MCP server** (`cleanmcp mcp`) so AI agents can explore disk usage and suggest what to clean up, using the same engine as the CLI.
+
+Guiding rule: **read-only by default.** Agents and users get evidence (sizes, ages, reasons). Deletion is a separate, explicit, opt-in step that moves files to the Recycle Bin / Trash and is never on by default for MCP.
+
+## Tech choices
+
+| Concern | Choice | Why |
+|---|---|---|
+| Language | Rust (edition 2024) | Single static binary per OS, fast filesystem walking, no runtime to install |
+| CLI parsing | `clap` (derive) | Standard, generates help and shell completions |
+| Parallel scan | `rayon` over `std::fs::read_dir` | Simple and fast; swap for `jwalk` or OS-specific APIs if profiling says so |
+| MCP | `rmcp` 3.x (official Rust SDK), stdio transport | Official, macro-based tool definitions, JSON Schema via `schemars` |
+| Output | Plain text tables + `--json` on every command | Humans and scripts/agents both covered |
+| TUI (later) | `ratatui` + `crossterm` | Works in Windows Terminal and Linux terminals |
+| Deletion (later) | `trash` crate | Recycle Bin on Windows, freedesktop Trash on Linux |
+
+## Architecture
+
+```
+crates/
+  cleanmcp-core/   library: no I/O except reading the filesystem, never deletes
+    scan.rs        parallel scan -> Node tree (symlinks/junctions not followed)
+    tree.rs        Node / Scan types, path lookup, walking
+    query.rs       largest files, extension breakdown, age filters
+    rules.rs       cleanup heuristics (node_modules, target, caches...) with safety levels
+  cleanmcp/        binary
+    main.rs        clap CLI: tree, files, ext, suggest, mcp
+    output.rs      text + JSON rendering
+    mcp.rs         MCP server; caches scans in memory per session
+```
+
+The CLI and MCP server both call `cleanmcp-core`, so their answers always match.
+
+## Current state (v0.1 scaffold): working
+
+- `cleanmcp tree [PATH] -d DEPTH -n TOP [--json]`
+- `cleanmcp files [PATH] -n TOP [--older-than-days N] [--json]`
+- `cleanmcp ext [PATH] -n TOP [--json]`
+- `cleanmcp suggest [PATH] [--min-mib N] [--json]`
+- `cleanmcp mcp` with read-only tools: `scan_directory`, `list_children`, `largest_files`, `extension_breakdown`, `find_cleanup_candidates`
+- Unit tests for size roll-up and rule matching; CI on Windows + Linux
+
+## Roadmap
+
+### Milestone 1: solid scanner
+- [ ] Allocated size on disk vs logical size (`GetCompressedFileSizeW` on Windows, `st_blocks` on Linux); add a `--apparent` flag
+- [ ] Hard-link de-duplication (inode / file ID) so totals are not inflated
+- [ ] `--one-filesystem` / skip other mounts (Linux `st_dev`; Windows volume serial)
+- [ ] Skip virtual filesystems on Linux by default (`/proc`, `/sys`, `/dev`, `/run`)
+- [ ] Exclude globs (`--exclude`), max depth during scan
+- [ ] Progress on stderr for long scans (entries/sec, current dir); cancel with Ctrl-C
+- [ ] Memory: move from `Vec<Node>` per dir to an arena (flat `Vec` + indices, interned names) and optionally drop file nodes below a size threshold. Target: under 100 B per entry, so a 5M-file drive fits in ~500 MB
+- [ ] Benchmarks against `dust`, `dua`, `gdu` on a large tree
+
+### Milestone 2: TreeSize features
+- [ ] `cleanmcp drives`: list volumes with total/free space (Windows `GetDiskFreeSpaceExW`, Linux `statvfs` + `/proc/mounts`)
+- [ ] Filters: `--min-size`, `--older-than`, `--newer-than`, `--ext`
+- [ ] Group by age buckets (TreeSize "age of files" view)
+- [ ] Duplicate finder (size -> partial hash -> full hash, `blake3`)
+- [ ] Export: CSV, JSON; snapshot to disk and `cleanmcp diff old.json new.json` to see what grew
+- [ ] More cleanup rules: Windows (`%TEMP%`, `SoftwareDistribution\Download`, browser caches, `Windows.old`, `$Recycle.Bin`, crash dumps), Linux (`~/.cache`, journal logs, package caches `apt`/`dnf`/`pacman`, old snaps, Docker), developer caches (npm/pnpm/yarn, cargo registry, pip, Gradle, Maven `.m2`, NuGet, Go module cache)
+- [ ] User-defined rules in a config file (`%APPDATA%\cleanmcp\config.toml` / `~/.config/cleanmcp/config.toml`)
+
+### Milestone 3: interactive TUI
+- [ ] `cleanmcp ui [PATH]`: navigable tree with size bars, sort by size/count/age, open in Explorer/file manager
+- [ ] Mark items, show total, then delete-to-trash with confirmation
+
+### Milestone 4: MCP for agents
+- [ ] Resources: expose the last scan summary as an MCP resource
+- [ ] Progress notifications during long scans
+- [ ] Pagination (`offset`/`cursor`) for big result lists; keep responses small by default
+- [ ] `list_drives`, `age_breakdown`, `find_duplicates` tools
+- [ ] Optional allow-list of scan roots (`cleanmcp mcp --root C:\Users\me`) so an agent cannot read the whole disk
+- [ ] Opt-in destructive tool `move_to_trash` only when started with `--allow-delete`; marked `destructive_hint`, requires paths to come from a previous candidates result, logs every action, and refuses system paths
+- [ ] Streamable HTTP transport (optional, for remote use)
+- [ ] Setup docs for Claude Code, Claude Desktop, VS Code, Cursor
+
+### Milestone 5: distribution
+- [ ] Release workflow: build `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`; attach zips/tarballs to GitHub releases
+- [ ] `cargo install`, winget, Scoop, AUR, Homebrew (Linux)
+- [ ] Shell completions and man page via `clap_complete` / `clap_mangen`
+
+## Safety principles
+
+1. Core library never deletes.
+2. MCP tools are read-only unless the server is started with an explicit flag.
+3. Deletion goes to the Recycle Bin / Trash, never permanent, and never follows links.
+4. Every suggestion carries a reason and a safety level (`regenerable` vs `review`).
+5. System locations (`C:\Windows`, `/usr`, `/etc`, ...) are never suggested for deletion.
+
+## Platform notes
+
+- **Windows:** junctions and symlinks are reparse points; `symlink_metadata` reports them as links, so we do not follow them. Long paths (>260 chars) work through `std` (it uses `\\?\` internally). Some folders need admin rights; they are counted in `errors`, not fatal. Later: NTFS MFT reading for very fast whole-drive scans (needs admin; optional).
+- **Linux:** do not cross into `/proc` or `/sys`; handle permission errors; respect `st_blocks` for sparse files.

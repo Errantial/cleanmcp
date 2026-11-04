@@ -1,0 +1,15 @@
+[package]
+name = "cleanmcp-core"
+description = "Disk usage scanning and cleanup analysis used by the cleanmcp CLI and MCP server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rayon.workspace = true
+serde.workspace = true
+schemars.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
