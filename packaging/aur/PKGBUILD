@@ -1,7 +1,7 @@
 # Maintainer: Errantial
 # AUR package for the prebuilt static binary. Not yet uploaded to the AUR.
 pkgname=cleanmcp-bin
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="TreeSize-style disk usage CLI with a built-in MCP server for AI agents"
 arch=('x86_64' 'aarch64')
@@ -11,8 +11,8 @@ provides=('cleanmcp')
 conflicts=('cleanmcp')
 source_x86_64=("$url/releases/download/v$pkgver/cleanmcp-$pkgver-x86_64-unknown-linux-musl.tar.gz")
 source_aarch64=("$url/releases/download/v$pkgver/cleanmcp-$pkgver-aarch64-unknown-linux-musl.tar.gz")
-sha256sums_x86_64=('e36dbb152acca13cc43ba9ebaa4bf5bea008d44219d6dbad9d3bca6e6e0cf8eb')
-sha256sums_aarch64=('1c3eb5fb488adb858b82fdd1c738f75b0c70930150f891131d4ab42a012c7ce7')
+sha256sums_x86_64=('3a0c2720238c2cbc6d29f97de80171bda30a9a8ffdaaaa67c3eeeee5c66458b2')
+sha256sums_aarch64=('7f505524e6ac1abb818486258b1aa07e0d2f5cd63e675f2e1ffb2e82df77bd31')
 
 package() {
     cd "cleanmcp-$pkgver-$CARCH-unknown-linux-musl"
