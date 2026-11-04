@@ -253,17 +253,60 @@ pub fn print_age(stats: &[AgeStat], mode: SizeMode) {
     }
 }
 
-pub fn print_dupes(groups: &[DuplicateGroup], total_groups: usize, total_wasted: u64) {
+/// JSON document for `dupes --json`: totals for every group found, plus the
+/// (possibly truncated) page in `groups`.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct DupesJson {
+    /// Duplicate groups found, before `--top` (and therefore possibly more than
+    /// `groups.len()`).
+    pub total_groups: usize,
+    /// Bytes freed by keeping one copy of every group, in the requested size
+    /// mode (disk by default, `--apparent` for file lengths).
+    pub total_wasted: u64,
+    pub groups: Vec<DuplicateGroup>,
+}
+
+impl DupesJson {
+    /// Sort by wasted bytes in `mode`, keep `top` groups, and keep the totals
+    /// of all groups found.
+    pub fn build(groups: Vec<DuplicateGroup>, top: usize, mode: SizeMode) -> Self {
+        let mut groups = groups;
+        let total_groups = groups.len();
+        let total_wasted: u64 = groups.iter().map(|g| g.wasted_by(mode)).sum();
+        groups.sort_unstable_by(|a, b| {
+            b.wasted_by(mode)
+                .cmp(&a.wasted_by(mode))
+                .then_with(|| a.paths.cmp(&b.paths))
+        });
+        groups.truncate(top);
+        DupesJson {
+            total_groups,
+            total_wasted,
+            groups,
+        }
+    }
+}
+
+pub fn print_dupes(
+    groups: &[DuplicateGroup],
+    total_groups: usize,
+    total_wasted: u64,
+    mode: SizeMode,
+) {
     if groups.is_empty() {
-        println!("No duplicate files found.");
+        if total_groups == 0 {
+            println!("No duplicate files found.");
+        } else {
+            println!("No duplicate groups shown ({total_groups} found; raise --top).");
+        }
         return;
     }
     for g in groups {
         println!(
             "{} wasted  ({} copies of {})",
-            human(g.wasted),
+            human(g.wasted_by(mode)),
             g.paths.len(),
-            human(g.size)
+            human(g.size_by(mode))
         );
         for p in &g.paths {
             println!("    {}", p.display());
@@ -541,6 +584,61 @@ mod tests {
             min_size: 0,
             mode: SizeMode::Disk,
         }
+    }
+
+    fn dupe_group(
+        name: &str,
+        size: u64,
+        copies: usize,
+        disk: u64,
+        wasted_disk: u64,
+    ) -> DuplicateGroup {
+        let paths = (0..copies)
+            .map(|i| PathBuf::from(format!("{name}{i}")))
+            .collect();
+        DuplicateGroup {
+            size,
+            disk_size: disk,
+            wasted: size * (copies as u64 - 1),
+            wasted_disk_size: wasted_disk,
+            hash: format!("hash-{name}"),
+            paths,
+        }
+    }
+
+    #[test]
+    fn dupes_json_reports_totals_and_prices_by_mode() {
+        // Same logical waste, very different on-disk waste: the default (disk)
+        // order must put the big allocation first.
+        let groups = vec![
+            dupe_group("small", 50, 3, 1_000, 2_000),
+            dupe_group("big", 100, 2, 10_000, 10_000),
+        ];
+        let d = DupesJson::build(groups.clone(), 1, SizeMode::Disk);
+        assert_eq!(d.total_groups, 2);
+        assert_eq!(d.total_wasted, 12_000);
+        assert_eq!(d.groups.len(), 1);
+        assert_eq!(d.groups[0].paths[0], PathBuf::from("big0"));
+
+        let d = DupesJson::build(groups, 10, SizeMode::Apparent);
+        assert_eq!(d.total_groups, 2);
+        assert_eq!(d.total_wasted, 200);
+        assert_eq!(d.groups.len(), 2);
+
+        let v = serde_json::to_value(DupesJson::build(
+            vec![self::dupe_group("g", 10, 2, 4096, 4096)],
+            10,
+            SizeMode::Apparent,
+        ))
+        .unwrap();
+        let obj = v.as_object().unwrap();
+        let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["groups", "total_groups", "total_wasted"]);
+        let group = &obj["groups"][0];
+        assert_eq!(group["size"], 10);
+        assert_eq!(group["disk_size"], 4096);
+        assert_eq!(group["wasted"], 10);
+        assert_eq!(group["wasted_disk_size"], 4096);
     }
 
     #[test]

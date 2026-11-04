@@ -38,6 +38,13 @@ CLI flags are unchanged.
   `\\?\` prefixes are well formed.
 
 ### CLI
+- `dupes` now prices each copy and the wasted total in the selected size mode: the default reports
+  space used on disk (matching the rest of the tool) and `--apparent` reports logical lengths.
+  Grouping still uses the logical length, which identical content requires.
+- **Breaking:** `dupes --json` is now an object with `total_groups`, `total_wasted` and `groups`
+  instead of a bare array, so a truncated page no longer hides how many groups exist or what they
+  total. Every group also reports `disk_size` and `wasted_disk_size`; the MCP `find_duplicates`
+  groups gain those two fields (additive) and keep their logical totals.
 - An explicit `--config` path that does not exist now errors instead of silently using defaults.
 
 ### Build

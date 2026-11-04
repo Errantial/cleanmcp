@@ -401,15 +401,13 @@ fn main() -> Result<()> {
         } => {
             let cfg = config()?;
             let s = scan.run(&cfg)?;
-            let mut groups =
-                dupes::find_duplicates(&s.tree, &s.root, &dupes::DupeOptions { min_size });
-            let total_wasted: u64 = groups.iter().map(|g| g.wasted).sum();
-            let total_groups = groups.len();
-            groups.truncate(top);
+            let mode = scan.mode();
+            let groups = dupes::find_duplicates(&s.tree, &s.root, &dupes::DupeOptions { min_size });
+            let d = output::DupesJson::build(groups, top, mode);
             if json {
-                output::print_json(&groups)
+                output::print_json(&d)
             } else {
-                output::print_dupes(&groups, total_groups, total_wasted);
+                output::print_dupes(&d.groups, d.total_groups, d.total_wasted, mode);
                 Ok(())
             }
         }
