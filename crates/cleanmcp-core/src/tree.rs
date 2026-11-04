@@ -28,6 +28,68 @@ pub enum SizeMode {
 /// Marker for "modification time unknown" in [`Node::mtime`].
 pub const NO_TIME: u32 = u32::MAX;
 
+/// Compare two file names the way the platform's filesystem does: byte-exact on
+/// Unix, ASCII-case-insensitively on Windows.
+///
+/// Only ASCII is folded. A Unicode fold can equate two names Windows keeps apart,
+/// and these helpers decide what may be deleted, so they must never over-match.
+pub fn names_eq(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+fn component_eq(a: std::path::Component<'_>, b: std::path::Component<'_>) -> bool {
+    if cfg!(windows) {
+        let a = a.as_os_str().to_string_lossy();
+        let b = b.as_os_str().to_string_lossy();
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a.as_os_str() == b.as_os_str()
+    }
+}
+
+/// `path` relative to `base`, comparing components the way the platform does.
+/// `None` when `path` is not at or below `base`.
+pub fn strip_prefix_ci(path: &Path, base: &Path) -> Option<PathBuf> {
+    let mut rest = path.components();
+    for component in base.components() {
+        if !component_eq(rest.next()?, component) {
+            return None;
+        }
+    }
+    Some(rest.collect())
+}
+
+/// Whether `path` is `base` itself or inside it, by platform path identity.
+pub fn is_within(path: &Path, base: &Path) -> bool {
+    strip_prefix_ci(path, base).is_some()
+}
+
+/// Whether two paths name the same file or folder.
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    strip_prefix_ci(a, b).is_some_and(|rest| rest.as_os_str().is_empty())
+}
+
+/// A hashable key that follows the platform's path identity (component-wise,
+/// ASCII case-folded on Windows). Used by the MCP server's "paths shown to the
+/// agent" set so membership is O(1) instead of a scan of every shown path.
+pub fn path_key(path: &Path) -> String {
+    let mut key = String::new();
+    for component in path.components() {
+        // A NUL cannot occur in a file name, so keys cannot run into each other.
+        key.push('\0');
+        if cfg!(windows) {
+            key.push_str(&component.as_os_str().to_string_lossy().to_ascii_lowercase());
+        } else {
+            key.push_str(&component.as_os_str().to_string_lossy());
+        }
+    }
+    key
+}
+
 /// Convert Unix seconds (from metadata or a snapshot file) to [`Node::mtime`]'s form.
 ///
 /// Times before 1970 are clamped to the epoch (they are "very old" either way) and
@@ -243,7 +305,10 @@ impl Node {
             if name == "." {
                 continue;
             }
-            node = node.children().iter().find(|c| *c.name == *name)?;
+            node = node
+                .children()
+                .iter()
+                .find(|c| names_eq(c.name.as_str(), &name))?;
         }
         Some(node)
     }
@@ -411,21 +476,22 @@ pub struct Scan {
 impl Scan {
     /// Look up a node by absolute path or path relative to the scan root.
     pub fn find(&self, path: &Path) -> Option<&Node> {
-        self.tree.find(self.relative(path)?)
+        let rel = self.relative(path)?;
+        self.tree.find(&rel)
     }
 
-    fn relative<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+    fn relative(&self, path: &Path) -> Option<PathBuf> {
         if path.is_absolute() {
-            path.strip_prefix(&self.root).ok()
+            strip_prefix_ci(path, &self.root)
         } else {
-            Some(path)
+            Some(path.to_path_buf())
         }
     }
 
     /// Remove the node at `path` (e.g. after deleting it) and subtract it from every ancestor.
     /// Returns the removed node. The root itself cannot be removed.
     pub fn remove(&mut self, path: &Path) -> Option<Node> {
-        let rel = self.relative(path)?.to_path_buf();
+        let rel = self.relative(path)?;
         let names: Vec<String> = rel
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
@@ -439,7 +505,10 @@ impl Scan {
 }
 
 fn remove_rec(node: &mut Node, names: &[String]) -> Option<Node> {
-    let idx = node.children().iter().position(|c| *c.name == *names[0])?;
+    let idx = node
+        .children()
+        .iter()
+        .position(|c| names_eq(c.name.as_str(), &names[0]))?;
     let removed = if names.len() == 1 {
         let mut v = node.take_children();
         let r = v.remove(idx);
@@ -469,6 +538,25 @@ mod tests {
         let mut n = Node::new(NodeKind::File, CompactString::from(name), size, size, 0);
         n.set_counts(1, 0, 0);
         n
+    }
+
+    fn dir(name: &str, children: Vec<Node>) -> Node {
+        let mut n = Node::new(NodeKind::Dir, CompactString::from(name), 0, 0, 0);
+        n.set_children(children);
+        n.finish_dir();
+        n
+    }
+
+    fn scan_of(root: &str, tree: Node) -> Scan {
+        Scan {
+            root: PathBuf::from(root),
+            tree,
+            scanned_at: 0,
+            started_at: 0,
+            elapsed_ms: 0,
+            stats: ScanStats::default(),
+            settings: ScanSettings::default(),
+        }
     }
 
     #[test]
@@ -535,5 +623,78 @@ mod tests {
         assert_eq!(n.mtime_unix(), i64::MIN);
         assert!(n.modified().is_none());
         assert!(n.age().is_none());
+    }
+
+    #[test]
+    fn path_keys_separate_components() {
+        // Keys must not run two components together into one name.
+        assert_ne!(path_key(Path::new("/ab")), path_key(Path::new("/a/b")));
+        assert_eq!(path_key(Path::new("a/./b")), path_key(Path::new("a/b")));
+        // A backslash is a separator on Windows and a legal name character on Unix.
+        #[cfg(windows)]
+        assert_eq!(path_key(Path::new("a/b")), path_key(Path::new("a\\b")));
+        #[cfg(not(windows))]
+        assert_ne!(path_key(Path::new("a/b")), path_key(Path::new("a\\b")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_are_case_insensitive() {
+        let mut s = scan_of(
+            r"C:\Users\me",
+            dir("me", vec![dir("Project", vec![file("File.TXT", 30)])]),
+        );
+        assert_eq!(s.tree.disk_size, 30);
+
+        // A retyped path in another case finds the same node.
+        assert_eq!(
+            s.find(Path::new(r"c:\users\ME\project\FILE.txt"))
+                .map(|n| n.size),
+            Some(30)
+        );
+        // Prefixes match by component, not by bytes.
+        assert!(is_within(
+            Path::new(r"C:\Users\me"),
+            Path::new(r"c:\USERS\ME")
+        ));
+        assert!(!is_within(
+            Path::new(r"C:\Users\meeting"),
+            Path::new(r"C:\Users\me")
+        ));
+        assert!(same_path(
+            Path::new(r"C:\Users\me\a"),
+            Path::new(r"c:\users\ME\A")
+        ));
+        assert_eq!(
+            path_key(Path::new(r"C:\Users\me\a")),
+            path_key(Path::new(r"c:\users\ME\A"))
+        );
+
+        // Removing with a case variant prunes the right node and its bytes.
+        let removed = s
+            .remove(Path::new(r"c:\users\me\PROJECT\file.txt"))
+            .expect("case variant should be found");
+        assert_eq!(removed.size, 30);
+        assert_eq!(s.tree.disk_size, 0);
+        assert!(s.find(Path::new(r"C:\Users\me\project\FILE.TXT")).is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_paths_are_exact() {
+        let mut s = scan_of(
+            "/home/me",
+            dir("me", vec![dir("Project", vec![file("File.TXT", 3)])]),
+        );
+        assert!(
+            s.find(Path::new("/home/me/Project/File.TXT")).is_some(),
+            "exact path must still be found"
+        );
+        assert!(s.find(Path::new("/home/me/project/File.TXT")).is_none());
+        assert!(!same_path(Path::new("/home/me/A"), Path::new("/home/me/a")));
+        assert_ne!(path_key(Path::new("/a")), path_key(Path::new("/A")));
+        assert!(!is_within(Path::new("/home/meet"), Path::new("/home/me")));
+        assert!(s.remove(Path::new("/home/me/project/File.TXT")).is_none());
+        assert!(s.remove(Path::new("/home/me/Project/File.TXT")).is_some());
     }
 }
