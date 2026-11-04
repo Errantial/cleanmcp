@@ -557,7 +557,8 @@ mod tests {
         assert_eq!(lines.len(), 5, "{text}");
         let row = lines
             .iter()
-            .find(|l| l.contains(odd_name()))
+            // CSV doubles an embedded quote, so search for the escaped form.
+            .find(|l| l.contains(&odd_name().replace('"', "\"\"")))
             .expect("file row");
         // The whole path is quoted because it contains a comma.
         assert!(row.starts_with('"'), "not CSV-quoted: {row}");
