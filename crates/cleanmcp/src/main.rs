@@ -263,12 +263,22 @@ enum Command {
     },
 }
 
+/// Load the config, treating a missing *explicit* path as a typo rather than
+/// "use defaults" (the default location may legitimately not exist).
+fn load_config(path: Option<&std::path::Path>) -> Result<Config> {
+    if let Some(p) = path
+        && !p.exists()
+    {
+        bail!("config file not found: {}", p.display());
+    }
+    Config::load(path).map_err(|e| anyhow::anyhow!("config error: {e}"))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = cli.config.clone();
     // Loaded only by commands that use it, so a broken config cannot block the others.
-    let config =
-        || Config::load(config_path.as_deref()).map_err(|e| anyhow::anyhow!("config error: {e}"));
+    let config = || load_config(config_path.as_deref());
     match cli.command {
         Command::Completions { shell } => {
             clap_complete::generate(
@@ -578,5 +588,19 @@ mod tests {
         // A file root is never "unreadable" in this sense.
         let f = Node::new(NodeKind::File, "f".into(), 1, 1, 0);
         assert!(!root_unreadable(&scan_with(f)));
+    }
+
+    #[test]
+    fn explicit_missing_config_is_an_error() {
+        let missing = std::path::Path::new("no-such-cleanmcp-config.toml");
+        assert!(!missing.exists());
+        let err = load_config(Some(missing)).unwrap_err().to_string();
+        assert!(err.contains("config file not found"), "{err}");
+
+        // A path that does exist still loads (an empty file is valid defaults).
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("c.toml");
+        std::fs::write(&ok, "").unwrap();
+        assert!(load_config(Some(&ok)).is_ok());
     }
 }

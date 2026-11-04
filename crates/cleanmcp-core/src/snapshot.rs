@@ -38,6 +38,10 @@ const READ_BUF: usize = 256 * 1024;
 struct Header {
     format: String,
     version: u32,
+    // `serde` refuses a `PathBuf` that is not valid UTF-8, which would make
+    // `snapshot` fail after a successful scan of such a root on Linux. The
+    // display path is lossy everywhere else, so store that.
+    #[serde(serialize_with = "serialize_lossy_path")]
     root: PathBuf,
     scanned_at: i64,
     elapsed_ms: u64,
@@ -45,6 +49,10 @@ struct Header {
     settings: ScanSettings,
     #[serde(default)]
     stats: ScanStats,
+}
+
+fn serialize_lossy_path<S: serde::Serializer>(p: &Path, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&p.to_string_lossy())
 }
 
 /// The metadata in a snapshot's first line, without the tree.
@@ -792,7 +800,7 @@ mod tests {
         // Quotes and backslashes are illegal in Windows file names, so the
         // escape-heavy cases are unix-only; `jsonwrite` and the old-snapshot
         // fixture cover escaping on both platforms.
-        let mut names = vec!["hÃ©llo ðŸš€", "comma,name", "sp ace"];
+        let mut names = vec!["hÃƒÂ©llo Ã°Å¸Å¡â‚¬", "comma,name", "sp ace"];
         if cfg!(unix) {
             names.push("quote\"inside");
             names.push("back\\slash");
@@ -979,9 +987,9 @@ mod tests {
         // `"` is not a legal Windows file name; the unicode name still checks
         // the common path on both platforms.
         let name = if cfg!(unix) {
-            "quo\"te Ã©"
+            "quo\"te ÃƒÂ©"
         } else {
-            "quo Ã©"
+            "quo ÃƒÂ©"
         };
         fs::write(p.join(name), vec![1u8; 8]).unwrap();
         let s = scan(&p, &ScanOptions::default()).unwrap();
