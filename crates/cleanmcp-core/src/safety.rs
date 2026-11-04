@@ -152,6 +152,29 @@ fn protection_reason_for(path: &Path, home: Option<&Path>) -> Option<&'static st
             return Some("it belongs to another user profile");
         }
     }
+    // Folders holding already-deleted or system-managed data. Trashing them
+    // removes more than the folder's own contents: every user's recycled files,
+    // restore points, or the still-recoverable items in the trash.
+    #[cfg(windows)]
+    if p.split('/')
+        .any(|c| matches!(c, "$recycle.bin" | "system volume information"))
+    {
+        return Some("it is a Windows system store (Recycle Bin or restore points)");
+    }
+    #[cfg(not(windows))]
+    {
+        // `$XDG_DATA_HOME/Trash`, by default `~/.local/share/Trash`.
+        let mut trash: Vec<String> = home
+            .iter()
+            .map(|h| format!("{h}/.local/share/Trash"))
+            .collect();
+        if let Some(d) = dirs::data_local_dir() {
+            trash.push(norm(&d.join("Trash")));
+        }
+        if trash.iter().any(|t| is_same_or_inside(&p, t)) {
+            return Some("it is the trash folder; empty it with the OS tool instead");
+        }
+    }
     if container_dirs().iter().any(|d| p == norm(d)) {
         return Some("it is a top-level system folder");
     }
@@ -193,6 +216,18 @@ mod tests {
         assert!(r(r"D:\games\old").is_none());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn recycle_bin_and_restore_points_are_protected() {
+        let home = Path::new(r"C:\Users\me");
+        let r = |p: &str| protection_reason_for(Path::new(p), Some(home));
+        assert!(r(r"C:\$Recycle.Bin").is_some());
+        assert!(r(r"D:\$Recycle.Bin\S-1-5-21-1").is_some());
+        assert!(r(r"C:\System Volume Information").is_some());
+        // Only a whole path component counts.
+        assert!(r(r"C:\$Recycle.Bin-old\x").is_none());
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn linux_rules() {
@@ -214,5 +249,18 @@ mod tests {
         let r = |p: &str| protection_reason_for(Path::new(p), Some(relocated));
         assert!(r("/var/home/other/x").is_some());
         assert!(r("/var/home/me/.cache/x").is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_trash_folder_is_protected() {
+        let home = Path::new("/home/me");
+        let r = |p: &str| protection_reason_for(Path::new(p), Some(home));
+        // Trashing the trash would lose every recoverable item at once.
+        assert!(r("/home/me/.local/share/Trash").is_some());
+        assert!(r("/home/me/.local/share/Trash/files/old.txt").is_some());
+        // A project folder that happens to be named Trash is not the trash.
+        assert!(r("/home/me/.local/share/projects/Trash/x").is_none());
+        assert!(r("/home/me/.local/share/applications/x.desktop").is_none());
     }
 }
