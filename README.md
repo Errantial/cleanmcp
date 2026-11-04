@@ -9,6 +9,7 @@ A TreeSize-style disk usage explorer for the terminal on Windows and Linux, with
 ## Usage
 
 ```sh
+cleanmcp ui ~                          # interactive browser (mark + move to trash)
 cleanmcp drives                        # volumes and free space
 cleanmcp tree C:\Users\me -d 2         # size tree, largest first
 cleanmcp files ~ --min-size 500MB --older-than 180
@@ -42,7 +43,8 @@ safety = "review"              # or "regenerable"
 reason = "Rendered video output"
 ```
 
-Nothing is ever deleted. `suggest` lists folders with a reason and a safety level:
+Only `cleanmcp ui` can delete, and only by moving items to the Recycle Bin / Trash after you confirm.
+System folders, drive roots and your home folder are always refused. `suggest` lists folders with a reason and a safety level:
 `regenerable` (build output, caches) or `review` (may hold data you want).
 
 ## MCP server

@@ -45,6 +45,7 @@ The CLI and MCP server both call `cleanmcp-core`, so their answers always match.
 - `cleanmcp ext [PATH] -n TOP [--json]`
 - `cleanmcp suggest [PATH] [--min-size SIZE] [--json]`
 - `cleanmcp age|dupes|drives|rules|export|snapshot|diff` (Milestone 2)
+- `cleanmcp ui` interactive browser with delete-to-trash (Milestone 3)
 - `cleanmcp mcp` with read-only tools: `scan_directory`, `list_children`, `largest_files`, `extension_breakdown`, `find_cleanup_candidates`
 - Unit tests for size roll-up and rule matching; CI on Windows + Linux
 
@@ -70,8 +71,9 @@ The CLI and MCP server both call `cleanmcp-core`, so their answers always match.
 - [x] User config (`config.toml`): extra rules, `disable_rules`, default `exclude`; `cleanmcp rules` lists what is active
 
 ### Milestone 3: interactive TUI
-- [ ] `cleanmcp ui [PATH]`: navigable tree with size bars, sort by size/count/age, open in Explorer/file manager
-- [ ] Mark items, show total, then delete-to-trash with confirmation
+- [x] `cleanmcp ui [PATH]`: navigable tree with size bars and percentages; sort by size / file count / age / name; toggle disk vs apparent size; reveal in Explorer / file manager
+- [x] Mark items (total shown), then move them to the Recycle Bin / Trash after a confirmation dialog; the tree updates in place
+- [x] Protected paths (drive roots, your home folder and its parents, system folders) are refused by a shared check in `cleanmcp-core::safety`
 
 ### Milestone 4: MCP for agents
 - [ ] Resources: expose the last scan summary as an MCP resource

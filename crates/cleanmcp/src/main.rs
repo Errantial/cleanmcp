@@ -1,6 +1,8 @@
 mod mcp;
 mod output;
 mod progress;
+mod remove;
+mod ui;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -94,6 +96,11 @@ enum ExportFormat {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Browse interactively: navigate, mark and move items to the trash.
+    Ui {
+        #[command(flatten)]
+        scan: ScanArgs,
+    },
     /// Show a size tree of a directory (largest first).
     Tree {
         #[command(flatten)]
@@ -253,6 +260,10 @@ fn main() -> Result<()> {
     let cfg = config_result.map_err(|e| anyhow::anyhow!("config error: {e}"))?;
     match cli.command {
         Command::Mcp | Command::Drives { .. } => unreachable!("handled above"),
+        Command::Ui { scan } => {
+            let s = scan.run(&cfg)?;
+            ui::run(s, scan.mode())
+        }
         Command::Tree {
             scan,
             depth,

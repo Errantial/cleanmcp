@@ -13,6 +13,7 @@ pub mod dupes;
 mod os;
 pub mod query;
 pub mod rules;
+pub mod safety;
 pub mod scan;
 pub mod snapshot;
 pub mod tree;
