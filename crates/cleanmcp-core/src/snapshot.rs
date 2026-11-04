@@ -281,6 +281,11 @@ pub fn load(path: &Path) -> io::Result<Scan> {
 /// the kept children), and `file_count`/`dir_count` cover only the kept nodes.
 /// `diff` uses this: it never looks below its `--depth`, so pruning there is
 /// invisible in the result and saves most of the second tree's memory.
+///
+/// Rows below `max_depth` cannot reach the result, so they are skipped after
+/// their depth is read: only their framing (a closing `]`) is checked, not the
+/// name escapes or the individual numbers. `load` passes `usize::MAX` and still
+/// validates every row in full.
 pub fn load_truncated(path: &Path, max_depth: usize) -> io::Result<Scan> {
     let mut reader = open_reader(path)?;
     let header = read_header_line(&mut *reader, path)?;
@@ -302,7 +307,8 @@ pub fn load_truncated(path: &Path, max_depth: usize) -> io::Result<Scan> {
         if row.is_empty() {
             continue;
         }
-        let (depth, kind, name, size, disk, mtime, errors) = parse_row(row)?;
+        // The depth has to be read either way, to keep the order checks honest.
+        let depth = parse_depth(row)?;
         if root.is_none() && stack.is_empty() {
             if depth != 0 {
                 return Err(invalid("snapshot must start with the root node"));
@@ -311,14 +317,25 @@ pub fn load_truncated(path: &Path, max_depth: usize) -> io::Result<Scan> {
             return Err(invalid("snapshot nodes out of order"));
         }
         prev_depth = depth;
+        if depth > max_depth {
+            // Nothing needs closing: kept nodes never open a level below the cut.
+            debug_assert!(stack.len() <= depth);
+            if row.last() != Some(&b']') {
+                return Err(invalid("snapshot row is not terminated"));
+            }
+            // The row's parent is the last kept node exactly when it sits at the
+            // cut; a file there with children would show up wrong in the diff.
+            if stack.len() == depth && stack.last().is_some_and(|(parent, _)| !parent.is_dir()) {
+                return Err(invalid("snapshot has children under a non-directory"));
+            }
+            continue;
+        }
+        let (_, kind, name, size, disk, mtime, errors) = parse_row(row)?;
         while stack.len() > depth {
             close(&mut stack, &mut root, verify)?;
         }
         if root.is_some() {
             return Err(invalid("snapshot has more than one root node"));
-        }
-        if depth > max_depth {
-            continue;
         }
         let kind = kind_from(kind);
         let mut node = Node::new(kind, name, size, disk, mtime_to_u32(mtime));
@@ -382,6 +399,14 @@ fn close(
         None => *root = Some(node),
     }
     Ok(())
+}
+
+/// Just the depth (the first field) of a row: `[<digits>,...`.
+fn parse_depth(line: &[u8]) -> io::Result<usize> {
+    let mut p = Parser::new(line);
+    p.expect(b'[')?;
+    let depth = p.uint()?;
+    usize::try_from(depth).map_err(|_| invalid("depth too large"))
 }
 
 /// One row: `[depth, kind, name, size, disk_size, mtime, errors]`.
@@ -954,6 +979,80 @@ mod tests {
         let d_full = diff(&full.tree, &s.tree, &s.root, 1, 10, SizeMode::Disk);
         let d_shallow = diff(&shallow.tree, &s.tree, &s.root, 1, 10, SizeMode::Disk);
         assert_eq!(format!("{d_full:?}"), format!("{d_shallow:?}"));
+    }
+
+    #[test]
+    fn truncated_load_skips_rows_below_the_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("data");
+        fs::create_dir_all(p.join("sub")).unwrap();
+        fs::write(p.join("sub/leaf"), vec![1u8; 1000]).unwrap();
+        let s = scan(&p, &ScanOptions::default()).unwrap();
+        let full = dir.path().join("full.jsonl");
+        save(&s, &full).unwrap();
+
+        // Give the deep file row an invalid escape: a full load must reject it,
+        // a truncated one never looks at that row.
+        let text = fs::read_to_string(&full).unwrap();
+        let broken: Vec<String> = text
+            .lines()
+            .map(|l| {
+                if l.starts_with("[2,") {
+                    l.replace("leaf", "le\\qaf")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        let f = dir.path().join("broken.jsonl");
+        fs::write(&f, broken.join("\n") + "\n").unwrap();
+        assert!(load(&f).is_err(), "full load must validate every row");
+
+        let shallow = load_truncated(&f, 1).unwrap();
+        assert_eq!(shallow.tree.size, s.tree.size);
+        assert_eq!(shallow.tree.disk_size, s.tree.disk_size);
+        assert_eq!(shallow.find(Path::new("sub")).unwrap().size, 1000);
+    }
+
+    #[test]
+    fn truncated_load_still_rejects_a_row_cut_below_the_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("data");
+        fs::create_dir_all(p.join("sub")).unwrap();
+        fs::write(p.join("sub/leaf"), vec![1u8; 1000]).unwrap();
+        let s = scan(&p, &ScanOptions::default()).unwrap();
+        let full = dir.path().join("full.jsonl");
+        save(&s, &full).unwrap();
+
+        // Cutting the line, not just the file, must not slip past the framing check.
+        let text = fs::read_to_string(&full).unwrap();
+        let cut: Vec<String> = text
+            .lines()
+            .map(|l| {
+                if l.starts_with("[2,") {
+                    r#"[2,0,"lea"#.to_string()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        let f = dir.path().join("cut.jsonl");
+        fs::write(&f, cut.join("\n") + "\n").unwrap();
+        assert!(load_truncated(&f, 1).is_err());
+    }
+
+    #[test]
+    fn truncated_load_still_rejects_children_under_a_file_at_the_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = r#"{"format":"cleanmcp-snapshot","version":1,"root":"/x","scanned_at":0,"elapsed_ms":0}"#;
+        let f = dir.path().join("kids.jsonl");
+        fs::write(
+            &f,
+            format!("{header}\n[0,0,\"file\",1,1,0,0]\n[1,0,\"child\",1,1,0,0]\n"),
+        )
+        .unwrap();
+        // The file sits exactly at the cut, so its child is still checked against it.
+        assert!(load_truncated(&f, 0).is_err());
     }
 
     #[test]
