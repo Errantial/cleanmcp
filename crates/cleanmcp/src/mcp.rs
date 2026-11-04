@@ -149,7 +149,8 @@ pub struct ChildrenParams {
     pub path: String,
     /// Levels to expand (default 1, max 4).
     pub depth: Option<usize>,
-    /// Children per folder (default 20, max 200).
+    /// Children per folder (default 20, max 200). Lowered automatically when
+    /// `depth > 1` so one response stays under 20k rows.
     pub top: Option<usize>,
     /// Skip this many children at the first level (pagination).
     pub offset: Option<usize>,
@@ -198,6 +199,8 @@ pub struct DupesParams {
     pub min_size_mib: Option<u64>,
     /// Groups to return (default 20, max 200).
     pub top: Option<usize>,
+    /// Skip this many groups (pagination). Each page re-hashes the files.
+    pub offset: Option<usize>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -223,10 +226,24 @@ pub struct ScanSummary {
     pub dir_count: u64,
     /// Entries that could not be read (usually permission denied).
     pub errors: u64,
+    /// Entries skipped by the configured `exclude` globs or the virtual-fs filter.
+    pub excluded_entries: u64,
+    /// Directories skipped because they are on another filesystem.
+    pub skipped_mounts: u64,
+    /// Extra hard links to an already-counted file (counted as 0 bytes).
+    pub hardlinks_deduped: u64,
+    /// The scan was cancelled; totals are partial.
+    pub cancelled: bool,
+    /// Whether this scan stayed on one filesystem (echoes the request).
+    pub one_filesystem: bool,
     pub elapsed_ms: u64,
     pub scanned_at_utc: String,
     /// Largest direct children, by size on disk.
     pub top_children: Vec<Entry>,
+    /// Direct children not listed in `top_children`.
+    pub other_children_count: usize,
+    /// Disk size of the direct children not listed.
+    pub other_children_disk_size: u64,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -269,6 +286,8 @@ pub struct DupesResult {
     pub total_wasted_human: String,
     pub total_groups: usize,
     pub groups: Vec<DuplicateGroup>,
+    /// Offset to pass next to continue listing; null when this is the last page.
+    pub next_offset: Option<usize>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -283,6 +302,17 @@ fn page<T>(mut items: Vec<T>, offset: usize, top: usize) -> (Vec<T>, Option<usiz
     let items: Vec<T> = items.drain(offset.min(total)..).take(top).collect();
     let next = (offset + items.len() < total).then_some(offset + items.len());
     (items, next)
+}
+
+/// Most nodes a single `list_children` response may contain.
+const MAX_TREE_ROWS: usize = 20_000;
+
+/// Lower `top` so `depth` levels of fan-out stay within [`MAX_TREE_ROWS`].
+fn bounded_top(depth: usize, top: usize) -> usize {
+    (1..=top)
+        .rev()
+        .find(|t| t.saturating_pow(depth as u32) <= MAX_TREE_ROWS)
+        .unwrap_or(1)
 }
 
 fn mib(v: Option<u64>, default: u64) -> u64 {
@@ -342,7 +372,7 @@ impl CleanMcp {
     ) -> Result<Json<ScanSummary>, String> {
         let progress = meta.get_progress_token().map(|t| (t, peer));
         let scan = self
-            .get_scan(&p.path, p.refresh, p.one_filesystem, progress, ct)
+            .get_scan(&p.path, p.refresh, p.one_filesystem, true, progress, ct)
             .await?;
         let abs = self.absolute(&p.path)?;
         let s = scan.read().unwrap();
@@ -354,6 +384,7 @@ impl CleanMcp {
             .take(15)
             .map(|c| Entry::from_node(&abs.join(c.name.as_str()), c))
             .collect::<Vec<_>>();
+        let other = &t.children()[top_children.len().min(t.children().len())..];
         self.remember(top_children.iter().map(|e| &e.path));
         Ok(Json(ScanSummary {
             root: abs.clone(),
@@ -363,9 +394,16 @@ impl CleanMcp {
             file_count: t.file_count() as u64,
             dir_count: t.dir_count() as u64,
             errors: t.errors() as u64,
+            excluded_entries: s.stats.excluded,
+            skipped_mounts: s.stats.skipped_mounts,
+            hardlinks_deduped: s.stats.hardlinks_deduped,
+            cancelled: s.stats.cancelled,
+            one_filesystem: s.settings.one_filesystem,
             elapsed_ms: s.elapsed_ms,
             scanned_at_utc: format_time(s.scanned_at),
             top_children,
+            other_children_count: other.len(),
+            other_children_disk_size: other.iter().map(|c| c.disk_size).sum(),
         }))
     }
 
@@ -380,7 +418,7 @@ impl CleanMcp {
     ) -> Result<Json<TreeJson>, String> {
         let (path, scan) = self.resolve(&p.path).await?;
         let depth = p.depth.unwrap_or(1).clamp(1, 4);
-        let top = p.top.unwrap_or(20).min(200);
+        let top = bounded_top(depth, p.top.unwrap_or(20).min(200));
         let offset = p.offset.unwrap_or(0);
         // Building the JSON for a big folder can take a while: keep it off the
         // async workers (and hold the scan lock only inside this blocking task).
@@ -503,7 +541,13 @@ impl CleanMcp {
         let all = tokio::task::spawn_blocking(move || {
             let s = scan.read().unwrap();
             let node = find(&s, &path)?;
-            Ok::<_, String>(rules::find_candidates(&rules, node, &path, min_size))
+            Ok::<_, String>(rules::find_candidates(
+                &rules,
+                node,
+                &path,
+                min_size,
+                SizeMode::Disk,
+            ))
         })
         .await
         .map_err(|e| e.to_string())??;
@@ -538,6 +582,7 @@ impl CleanMcp {
         let (path, scan) = self.resolve(&p.path).await?;
         let min_size = mib(p.min_size_mib, 1).max(1);
         let top = p.top.unwrap_or(20).min(200);
+        let offset = p.offset.unwrap_or(0).min(MAX_OFFSET);
         let groups = tokio::task::spawn_blocking(move || {
             // Hold the scan lock only while listing files, not while reading them.
             let same_size = {
@@ -551,13 +596,14 @@ impl CleanMcp {
         .map_err(|e| e.to_string())??;
         let total_wasted: u64 = groups.iter().map(|g| g.wasted).sum();
         let total_groups = groups.len();
-        let groups: Vec<DuplicateGroup> = groups.into_iter().take(top).collect();
+        let (groups, next_offset) = page(groups, offset, top);
         self.remember(groups.iter().flat_map(|g| &g.paths));
         Ok(Json(DupesResult {
             total_wasted,
             total_wasted_human: human(total_wasted),
             total_groups,
             groups,
+            next_offset,
         }))
     }
 
@@ -765,7 +811,7 @@ impl CleanMcp {
     async fn resolve(&self, path: &str) -> Result<(PathBuf, SharedScan), String> {
         let abs = self.absolute(path)?;
         let scan = self
-            .get_scan(path, false, false, None, CancellationToken::new())
+            .get_scan(path, false, false, false, None, CancellationToken::new())
             .await?;
         Ok((abs, scan))
     }
@@ -775,17 +821,32 @@ impl CleanMcp {
         path: &str,
         refresh: bool,
         one_filesystem: bool,
+        // `scan_directory` answers the scope question the caller asked, so a
+        // cached scan made with different settings must not answer it.
+        require_settings: bool,
         progress: Option<(rmcp::model::ProgressToken, Peer<RoleServer>)>,
         ct: CancellationToken,
     ) -> Result<SharedScan, String> {
         let abs = self.absolute(path)?;
         if !refresh {
-            let cache = self.cache.lock().unwrap();
-            if let Some(s) = cache
+            let mut cache = self.cache.lock().unwrap();
+            // The most specific cached root wins: a refreshed subtree must not
+            // be shadowed by an older scan of one of its parents.
+            let hit = cache
                 .iter()
-                .find(|s| abs.starts_with(&s.read().unwrap().root))
-            {
-                return Ok(s.clone());
+                .enumerate()
+                .filter(|(_, s)| {
+                    let s = s.read().unwrap();
+                    abs.starts_with(&s.root)
+                        && (!require_settings || s.settings.one_filesystem == one_filesystem)
+                })
+                .max_by_key(|(_, s)| s.read().unwrap().root.as_os_str().len())
+                .map(|(i, _)| i);
+            if let Some(i) = hit {
+                // Re-insert at the back so eviction drops the least recently used.
+                let hit = cache.remove(i);
+                cache.push(hit.clone());
+                return Ok(hit);
             }
         }
         let opts = ScanOptions {
@@ -915,6 +976,18 @@ mod tests {
         let (items, next) = page((0..3).collect::<Vec<_>>(), 10, 4);
         assert!(items.is_empty());
         assert_eq!(next, None);
+    }
+
+    #[test]
+    fn fan_out_is_bounded_by_depth() {
+        // One level keeps the caller's top...
+        assert_eq!(bounded_top(1, 200), 200);
+        // ...deeper levels are lowered so depth Ã— top stays within the budget.
+        assert_eq!(bounded_top(2, 200), 141);
+        assert_eq!(bounded_top(3, 200), 27);
+        assert_eq!(bounded_top(4, 200), 11);
+        assert!(bounded_top(4, 200).pow(4) <= MAX_TREE_ROWS);
+        assert_eq!(bounded_top(2, 5), 5);
     }
 
     #[test]

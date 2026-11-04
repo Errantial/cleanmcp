@@ -141,16 +141,16 @@ pub fn print_extensions(stats: &[ExtensionStat], root: &Node, mode: SizeMode) {
     }
 }
 
-pub fn print_candidates(c: &[Candidate]) {
+pub fn print_candidates(c: &[Candidate], mode: SizeMode) {
     if c.is_empty() {
         println!("No cleanup candidates found.");
         return;
     }
-    let total: u64 = c.iter().map(|c| c.entry.disk_size).sum();
+    let total: u64 = c.iter().map(|c| c.entry.size_by(mode)).sum();
     for c in c {
         println!(
             "{:>10}  {:<11}  {}\n            {}",
-            human(c.entry.disk_size),
+            human(c.entry.size_by(mode)),
             format!("{:?}", c.safety).to_lowercase(),
             c.entry.path.display(),
             c.reason
