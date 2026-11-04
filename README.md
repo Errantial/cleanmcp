@@ -42,9 +42,10 @@ cleanmcp export ~ --format csv -o home.csv
 cleanmcp tree . --json                 # most commands support --json
 ```
 
-Sizes are space used on disk by default (`--apparent` for file lengths). Hard links are counted once
-(`--dedupe-hardlinks` on Windows), symlinks/junctions inside the tree are never followed (the path
-you pass is resolved first), and OneDrive online-only files count as 0 bytes on disk.
+Sizes are space used on disk by default (`--apparent` for logical file sizes). Hard links are
+counted once on Linux; pass `--dedupe-hardlinks` to do the same on Windows (slower). Symlinks and
+junctions inside the tree are never followed (the scan root you pass is resolved first), and
+OneDrive online-only files count as 0 bytes on disk.
 
 ### Custom cleanup rules
 
@@ -62,9 +63,11 @@ safety = "review"              # or "regenerable"
 reason = "Rendered video output"
 ```
 
-`cleanmcp ui` deletes after you confirm, and `cleanmcp mcp --allow-delete` lets an agent do the
-same for paths it was shown. Either way the item goes to the Recycle Bin / Trash, never removed
-permanently. System folders, drive roots and your home folder are always refused. `suggest` lists folders with a reason and a safety level:
+`cleanmcp ui` moves items to the trash after you confirm, and `cleanmcp mcp --allow-delete` lets an
+agent do the same for paths a tool returned in that session. Either way the item goes to the
+Recycle Bin / Trash, never removed permanently; a symlink is trashed as a link, not followed to its
+target. Drive roots, system folders, your home folder (and any folder containing it) and other
+users' profiles are always refused. `suggest` lists folders with a reason and a safety level:
 `regenerable` (build output, caches) or `review` (may hold data you want).
 
 ## MCP server
@@ -72,8 +75,11 @@ permanently. System folders, drive roots and your home folder are always refused
 `cleanmcp mcp` runs an MCP server (stdio, or HTTP with `--http`) so agents like Claude can explore
 your disks and suggest what to clean. Tools: `list_drives`, `scan_directory`, `list_children`,
 `largest_files`, `extension_breakdown`, `age_breakdown`, `find_cleanup_candidates`, `find_duplicates`.
-All read-only. `--allow-delete` adds `move_to_trash` (Recycle Bin only, refuses system folders,
-audit-logged) and `--root DIR` limits what the agent can see.
+All read-only. `--allow-delete` adds `move_to_trash`: it only accepts paths a tool returned in that
+session, still refuses drive roots, system folders, your home folder, other profiles and any
+`--root` folder, and logs every attempt that reaches the trash step. `--root DIR` limits which paths
+the tools may access. HTTP has no authentication, so `--allow-delete` is refused on a non-loopback
+`--http` address.
 
 ```sh
 claude mcp add --scope user cleanmcp -- cleanmcp mcp
@@ -89,7 +95,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-Requires Rust 1.85+. Roadmap and design notes: [PLAN.md](PLAN.md). Changes: [CHANGELOG.md](CHANGELOG.md).
+Requires Rust 1.88+. Roadmap and design notes: [PLAN.md](PLAN.md). Changes: [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
