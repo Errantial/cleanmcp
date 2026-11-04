@@ -349,7 +349,7 @@ impl CleanMcp {
         // A cached scan of a parent folder may have answered; report the folder asked for.
         let t = find(&s, &abs)?;
         let top_children = t
-            .children
+            .children()
             .iter()
             .take(15)
             .map(|c| Entry::from_node(&abs.join(c.name.as_str()), c))
@@ -360,9 +360,9 @@ impl CleanMcp {
             disk_size: t.disk_size,
             size: t.size,
             disk_size_human: human(t.disk_size),
-            file_count: t.file_count as u64,
-            dir_count: t.dir_count as u64,
-            errors: t.errors as u64,
+            file_count: t.file_count() as u64,
+            dir_count: t.dir_count() as u64,
+            errors: t.errors() as u64,
             elapsed_ms: s.elapsed_ms,
             scanned_at_utc: format_time(s.scanned_at),
             top_children,
@@ -379,16 +379,28 @@ impl CleanMcp {
         Parameters(p): Parameters<ChildrenParams>,
     ) -> Result<Json<TreeJson>, String> {
         let (path, scan) = self.resolve(&p.path).await?;
-        let s = scan.read().unwrap();
-        let node = find(&s, &path)?;
-        let tree = TreeJson::build_page(
-            node,
-            &path,
-            p.depth.unwrap_or(1).clamp(1, 4),
-            p.top.unwrap_or(20).min(200),
-            p.offset.unwrap_or(0),
-            SizeMode::Disk,
-        );
+        let depth = p.depth.unwrap_or(1).clamp(1, 4);
+        let top = p.top.unwrap_or(20).min(200);
+        let offset = p.offset.unwrap_or(0);
+        // Building the JSON for a big folder can take a while: keep it off the
+        // async workers (and hold the scan lock only inside this blocking task).
+        let tree = {
+            let scan_path = path.clone();
+            tokio::task::spawn_blocking(move || {
+                let s = scan.read().unwrap();
+                let node = find(&s, &scan_path)?;
+                Ok::<_, String>(TreeJson::build_page(
+                    node,
+                    &scan_path,
+                    depth,
+                    top,
+                    offset,
+                    SizeMode::Disk,
+                ))
+            })
+            .await
+            .map_err(|e| e.to_string())??
+        };
         let mut paths = Vec::new();
         tree.collect_paths(&mut paths);
         // Only the children count as shown; listing a folder must not make the folder itself deletable.
@@ -406,8 +418,6 @@ impl CleanMcp {
         Parameters(p): Parameters<FilesParams>,
     ) -> Result<Json<FilesResult>, String> {
         let (path, scan) = self.resolve(&p.path).await?;
-        let s = scan.read().unwrap();
-        let node = find(&s, &path)?;
         let top = p.top.unwrap_or(25).min(500);
         let offset = p.offset.unwrap_or(0).min(MAX_OFFSET);
         let filter = FileFilter {
@@ -417,13 +427,20 @@ impl CleanMcp {
             extensions: p.extensions,
         };
         // Ask for one extra to know whether there is a next page.
-        let all = query::largest_files(
-            node,
-            &path,
-            offset.saturating_add(top + 1),
-            &filter,
-            SizeMode::Disk,
-        );
+        let wanted = offset.saturating_add(top + 1);
+        let all = tokio::task::spawn_blocking(move || {
+            let s = scan.read().unwrap();
+            let node = find(&s, &path)?;
+            Ok::<_, String>(query::largest_files(
+                node,
+                &path,
+                wanted,
+                &filter,
+                SizeMode::Disk,
+            ))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         let (files, next_offset) = page(all, offset, top);
         self.remember(files.iter().map(|e| &e.path));
         Ok(Json(FilesResult { files, next_offset }))
@@ -438,11 +455,15 @@ impl CleanMcp {
         Parameters(p): Parameters<TopParams>,
     ) -> Result<Json<ExtResult>, String> {
         let (path, scan) = self.resolve(&p.path).await?;
-        let s = scan.read().unwrap();
-        let node = find(&s, &path)?;
-        Ok(Json(ExtResult {
-            extensions: query::by_extension(node, p.top.unwrap_or(25).min(500), SizeMode::Disk),
-        }))
+        let top = p.top.unwrap_or(25).min(500);
+        let extensions = tokio::task::spawn_blocking(move || {
+            let s = scan.read().unwrap();
+            let node = find(&s, &path)?;
+            Ok::<_, String>(query::by_extension(node, top, SizeMode::Disk))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(Json(ExtResult { extensions }))
     }
 
     #[tool(
@@ -455,11 +476,14 @@ impl CleanMcp {
         Parameters(p): Parameters<PathParams>,
     ) -> Result<Json<AgeResult>, String> {
         let (path, scan) = self.resolve(&p.path).await?;
-        let s = scan.read().unwrap();
-        let node = find(&s, &path)?;
-        Ok(Json(AgeResult {
-            buckets: query::by_age(node),
-        }))
+        let buckets = tokio::task::spawn_blocking(move || {
+            let s = scan.read().unwrap();
+            let node = find(&s, &path)?;
+            Ok::<_, String>(query::by_age(node))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(Json(AgeResult { buckets }))
     }
 
     #[tool(
@@ -474,9 +498,15 @@ impl CleanMcp {
         Parameters(p): Parameters<SuggestParams>,
     ) -> Result<Json<SuggestResult>, String> {
         let (path, scan) = self.resolve(&p.path).await?;
-        let s = scan.read().unwrap();
-        let node = find(&s, &path)?;
-        let all = rules::find_candidates(&self.rules, node, &path, mib(p.min_size_mib, 10));
+        let rules = self.rules.clone();
+        let min_size = mib(p.min_size_mib, 10);
+        let all = tokio::task::spawn_blocking(move || {
+            let s = scan.read().unwrap();
+            let node = find(&s, &path)?;
+            Ok::<_, String>(rules::find_candidates(&rules, node, &path, min_size))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         let total_disk_size = all.iter().map(|c| c.entry.disk_size).sum();
         let total_count = all.len();
         let (candidates, next_offset) = page(
@@ -693,8 +723,8 @@ impl ServerHandler for CleanMcp {
                     "root": s.root,
                     "disk_size": s.tree.disk_size,
                     "disk_size_human": human(s.tree.disk_size),
-                    "file_count": s.tree.file_count,
-                    "dir_count": s.tree.dir_count,
+                    "file_count": s.tree.file_count(),
+                    "dir_count": s.tree.dir_count(),
                     "scanned_at_utc": format_time(s.scanned_at),
                     "elapsed_ms": s.elapsed_ms,
                 })

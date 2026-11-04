@@ -45,6 +45,18 @@ impl Sort {
     }
 }
 
+/// Case-insensitive name order, equivalent to comparing `to_lowercase()`
+/// strings but without allocating one per comparison for ASCII names.
+fn cmp_name_ci(a: &str, b: &str) -> std::cmp::Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        a.bytes()
+            .map(|c| c.to_ascii_lowercase())
+            .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+    } else {
+        a.to_lowercase().cmp(&b.to_lowercase())
+    }
+}
+
 pub struct App {
     pub scan: Scan,
     /// Child names from the scan root down to the directory being shown.
@@ -87,7 +99,7 @@ impl App {
     pub fn current(&self) -> &Node {
         let mut n = &self.scan.tree;
         for name in &self.stack {
-            match n.children.iter().find(|c| c.name == *name) {
+            match n.children().iter().find(|c| c.name == *name) {
                 Some(c) => n = c,
                 None => break,
             }
@@ -105,7 +117,7 @@ impl App {
 
     pub fn selected(&self) -> Option<&Node> {
         let i = *self.view.get(self.list.selected()?)?;
-        self.current().children.get(i)
+        self.current().children().get(i)
     }
 
     fn selected_path(&self) -> Option<PathBuf> {
@@ -118,14 +130,18 @@ impl App {
         let mode = self.mode;
         let sort = self.sort;
         let node = self.current();
-        let mut v: Vec<usize> = (0..node.children.len()).collect();
-        let c = &node.children;
+        let mut v: Vec<usize> = (0..node.children().len()).collect();
+        let c = node.children();
         match sort {
-            Sort::Size => v.sort_by_key(|&i| std::cmp::Reverse(c[i].size_by(mode))),
-            Sort::Files => v.sort_by_key(|&i| std::cmp::Reverse(c[i].file_count)),
+            // The scanner keeps children sorted by size on disk, so the default
+            // view needs no sorting at all - even in a folder with 100k entries.
+            Sort::Size if mode == SizeMode::Disk => {}
+            Sort::Size => v.sort_unstable_by_key(|&i| std::cmp::Reverse(c[i].size_by(mode))),
+            Sort::Files => v.sort_unstable_by_key(|&i| std::cmp::Reverse(c[i].file_count())),
             // Unknown times go last, not first.
-            Sort::Age => v.sort_by_key(|&i| (c[i].mtime == NO_TIME, c[i].mtime)),
-            Sort::Name => v.sort_by_cached_key(|&i| c[i].name.to_lowercase()),
+            Sort::Age => v.sort_unstable_by_key(|&i| (c[i].mtime == NO_TIME, c[i].mtime)),
+            // Stable, and without lowercasing every name into a new String.
+            Sort::Name => v.sort_by(|&a, &b| cmp_name_ci(&c[a].name, &c[b].name)),
         }
         self.view = v;
         let len = self.view.len();
@@ -160,7 +176,7 @@ impl App {
             if let Some(pos) = self
                 .view
                 .iter()
-                .position(|&i| node.children[i].name == name)
+                .position(|&i| node.children()[i].name == name)
             {
                 self.list.select(Some(pos));
             }
@@ -337,8 +353,8 @@ impl App {
             Line::from(format!(
                 "{} {mode} · {} files · {} dirs · sorted by {}",
                 human(total),
-                node.file_count,
-                node.dir_count,
+                node.file_count(),
+                node.dir_count(),
                 self.sort.label()
             ))
             .dark_gray(),
@@ -349,7 +365,7 @@ impl App {
         let window = self.view.iter().skip(self.offset).take(height.max(1));
         let items: Vec<ListItem> = window
             .map(|&i| {
-                let c = &node.children[i];
+                let c = &node.children()[i];
                 let size = c.size_by(self.mode);
                 let share = pct(size, total);
                 let filled = ((share / 10.0).round() as usize).min(10);
@@ -359,7 +375,7 @@ impl App {
                     .age()
                     .map(|a| format!("{}d", a.as_secs() / 86_400))
                     .unwrap_or_default();
-                let (name, style) = match c.kind {
+                let (name, style) = match c.kind() {
                     NodeKind::Dir => (
                         format!("{}/", c.name),
                         Style::new().fg(Color::LightBlue).bold(),
@@ -369,12 +385,12 @@ impl App {
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(
-                        if marked { "● " } else { "  " },
+                        if marked { "▸ " } else { "  " },
                         Style::new().fg(Color::Yellow),
                     ),
                     Span::raw(format!("{:>10} ", human(size))),
                     Span::styled(bar, Style::new().fg(Color::Green)),
-                    Span::raw(format!(" {share:>5.1}% {:>8} {age:>6}  ", c.file_count)),
+                    Span::raw(format!(" {share:>5.1}% {:>8} {age:>6}  ", c.file_count())),
                     Span::styled(name, style),
                 ]))
             })

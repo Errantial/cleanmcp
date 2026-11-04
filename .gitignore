@@ -1,3 +1,6 @@
 /target
 *.pdb
 .DS_Store
+
+# Stray agent worktrees
+/.claude/

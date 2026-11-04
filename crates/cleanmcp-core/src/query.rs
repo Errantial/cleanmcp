@@ -1,14 +1,28 @@
 //! Read-only questions about a scanned tree.
+//!
+//! Every query walks the whole tree, so the per-node cost matters: these
+//! functions never build a `PathBuf` (or any other allocation) per node. Paths
+//! are materialised only for the rows that end up in the result.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::tree::{Node, NodeKind, SizeMode};
+use crate::tree::{NO_TIME, Node, NodeKind, SizeMode};
 
 const DAY: u64 = 86_400;
+
+/// Extension shown for files without one.
+const NO_EXT: &str = "(none)";
+
+/// Longest extension handled without allocating.
+const EXT_BUF: usize = 32;
+
+/// Longest name lowercased without allocating.
+pub(crate) const NAME_BUF: usize = 48;
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct Entry {
@@ -30,7 +44,7 @@ impl Entry {
             disk_size: n.disk_size,
             size: n.size,
             is_dir: n.is_dir(),
-            file_count: n.file_count as u64,
+            file_count: n.file_count() as u64,
             age_days: n.age().map(|d| d.as_secs() / DAY),
         }
     }
@@ -58,35 +72,69 @@ pub struct FileFilter {
 
 impl FileFilter {
     pub fn matches(&self, node: &Node, mode: SizeMode) -> bool {
-        if node.kind != NodeKind::File {
-            return false;
-        }
-        if self.min_size.is_some_and(|m| node.size_by(mode) < m) {
-            return false;
-        }
-        // A modification time in the future counts as age 0 (brand new).
-        let age_days = node.modified().map(|t| {
-            std::time::SystemTime::now()
-                .duration_since(t)
-                .map_or(0, |a| a.as_secs() / DAY)
-        });
-        if let Some(min) = self.older_than_days
-            && age_days.is_none_or(|a| a < min)
-        {
-            return false;
-        }
-        if let Some(max) = self.newer_than_days
-            && age_days.is_none_or(|a| a >= max)
-        {
-            return false;
-        }
-        if !self.extensions.is_empty() {
-            let ext = extension(&node.name);
-            if !self
+        Matcher::new(self).matches(node, mode)
+    }
+}
+
+/// A [`FileFilter`] prepared for a whole walk: the clock is read once and the
+/// extension list is lowercased once instead of once per file.
+struct Matcher<'a> {
+    filter: &'a FileFilter,
+    /// Unix seconds when the query started; `None` time compares as 0 days old.
+    now: i64,
+    /// `filter.extensions` lowercased, without the leading dot.
+    exts: Vec<String>,
+}
+
+impl<'a> Matcher<'a> {
+    fn new(filter: &'a FileFilter) -> Self {
+        Matcher {
+            filter,
+            now: unix_now(),
+            exts: filter
                 .extensions
                 .iter()
-                .any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(&ext))
+                .map(|e| e.trim_start_matches('.').to_lowercase())
+                .collect(),
+        }
+    }
+
+    fn matches(&self, node: &Node, mode: SizeMode) -> bool {
+        if node.kind() != NodeKind::File {
+            return false;
+        }
+        if self.filter.min_size.is_some_and(|m| node.size_by(mode) < m) {
+            return false;
+        }
+        if self.filter.older_than_days.is_some() || self.filter.newer_than_days.is_some() {
+            // A modification time in the future counts as age 0 (brand new);
+            // an unknown one matches neither age filter.
+            let Some(age_days) = node_age_days(node, self.now) else {
+                return false;
+            };
+            if let Some(min) = self.filter.older_than_days
+                && age_days < min
             {
+                return false;
+            }
+            if let Some(max) = self.filter.newer_than_days
+                && age_days >= max
+            {
+                return false;
+            }
+        }
+        if !self.exts.is_empty() {
+            let mut buf = [0u8; EXT_BUF];
+            let name = node.name.as_str();
+            let hit = match lower_ext(name, &mut buf) {
+                Some(ext) => self.exts.iter().any(|e| e == ext),
+                // Long or non-ASCII extension: rare, fall back to allocating.
+                None => {
+                    let ext = extension(name);
+                    self.exts.contains(&ext)
+                }
+            };
+            if !hit {
                 return false;
             }
         }
@@ -94,12 +142,85 @@ impl FileFilter {
     }
 }
 
+/// Whole days since `node` was last modified, as of `now` (Unix seconds).
+/// `None` when the timestamp is unknown; a future timestamp counts as 0.
+fn node_age_days(node: &Node, now: i64) -> Option<u64> {
+    if node.mtime == NO_TIME {
+        return None;
+    }
+    let secs = now.saturating_sub(node.mtime as i64);
+    Some(if secs <= 0 { 0 } else { secs as u64 / DAY })
+}
+
+pub(crate) fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The extension of `name` as `std::path::Path::extension` defines it.
+fn ext_of(name: &str) -> Option<&str> {
+    if name == "." || name == ".." {
+        return None;
+    }
+    let bytes = name.as_bytes();
+    // Only the last path component counts; a separator means "no extension".
+    let start = match bytes.iter().rposition(|b| *b == b'/' || *b == b'\\') {
+        Some(i) => i + 1,
+        None => 0,
+    };
+    let dot = start + bytes[start..].iter().rposition(|b| *b == b'.')?;
+    // A leading dot (".gitignore") is a hidden file, not an extension.
+    if dot == start {
+        return None;
+    }
+    Some(&name[dot + 1..])
+}
+
+/// Lowercased extension of `name` written into `buf` (no allocation), or
+/// `"(none)"`. `None` means "too long or not ASCII": use [`extension`].
+fn lower_ext<'b>(name: &str, buf: &'b mut [u8; EXT_BUF]) -> Option<&'b str> {
+    let Some(ext) = ext_of(name) else {
+        return Some(NO_EXT);
+    };
+    if ext.len() > EXT_BUF || !ext.is_ascii() {
+        return None;
+    }
+    let out = &mut buf[..ext.len()];
+    out.copy_from_slice(ext.as_bytes());
+    out.make_ascii_lowercase();
+    std::str::from_utf8(out).ok()
+}
+
 /// Lowercased extension without the dot, or "(none)".
 pub fn extension(name: &str) -> String {
-    Path::new(name)
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_else(|| "(none)".into())
+    ext_of(name)
+        .map(|e| e.to_lowercase())
+        .unwrap_or_else(|| NO_EXT.into())
+}
+
+/// ASCII-lowercase `s` into `buf` without allocating. `None` when it does not
+/// fit or is not ASCII (then the caller keeps its allocating path).
+pub(crate) fn lower_into<'b>(s: &str, buf: &'b mut [u8; NAME_BUF]) -> Option<&'b str> {
+    if s.len() > NAME_BUF || !s.is_ascii() {
+        return None;
+    }
+    let out = &mut buf[..s.len()];
+    out.copy_from_slice(s.as_bytes());
+    out.make_ascii_lowercase();
+    std::str::from_utf8(out).ok()
+}
+
+/// Visit every file node, without building paths.
+fn visit_files(node: &Node, f: &mut impl FnMut(&Node)) {
+    if node.kind() == NodeKind::File {
+        f(node);
+        return;
+    }
+    for c in node.children().iter() {
+        visit_files(c, f);
+    }
 }
 
 /// The `n` largest files anywhere below `base` that pass `filter`.
@@ -113,28 +234,76 @@ pub fn largest_files(
     if n == 0 {
         return Vec::new();
     }
-    // Bounded min-heap over slots, so memory stays O(n) on huge trees.
-    let mut slots: Vec<(PathBuf, &Node)> = Vec::with_capacity(n);
-    let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::with_capacity(n);
-    root.walk(base, &mut |p, node| {
-        if !filter.matches(node, mode) {
-            return;
+    let matcher = Matcher::new(filter);
+    let mut top = TopN::new(n);
+    let mut path = base.to_path_buf();
+    collect_largest(root, &mut path, &matcher, mode, &mut top);
+    top.into_entries(mode)
+}
+
+fn collect_largest<'a>(
+    node: &'a Node,
+    path: &mut PathBuf,
+    matcher: &Matcher<'_>,
+    mode: SizeMode,
+    top: &mut TopN<'a>,
+) {
+    for c in node.children().iter() {
+        match c.kind() {
+            // Files are the only matches, so they never need a path of their own.
+            NodeKind::File => {
+                if matcher.matches(c, mode) {
+                    top.offer(path, c, mode);
+                }
+            }
+            _ => {
+                path.push(c.name.as_str());
+                collect_largest(c, path, matcher, mode, top);
+                path.pop();
+            }
         }
+    }
+}
+
+/// Bounded min-heap over slots, so memory stays O(n) on huge trees.
+struct TopN<'a> {
+    slots: Vec<(PathBuf, &'a Node)>,
+    heap: BinaryHeap<Reverse<(u64, usize)>>,
+    cap: usize,
+}
+
+impl<'a> TopN<'a> {
+    fn new(cap: usize) -> Self {
+        TopN {
+            slots: Vec::with_capacity(cap),
+            heap: BinaryHeap::with_capacity(cap),
+            cap,
+        }
+    }
+
+    fn offer(&mut self, parent: &Path, node: &'a Node, mode: SizeMode) {
         let size = node.size_by(mode);
-        if slots.len() < n {
-            heap.push(Reverse((size, slots.len())));
-            slots.push((p.to_path_buf(), node));
-        } else if let Some(&Reverse((min, idx))) = heap.peek()
+        if self.slots.len() < self.cap {
+            self.heap.push(Reverse((size, self.slots.len())));
+            self.slots.push((parent.join(node.name.as_str()), node));
+        } else if let Some(&Reverse((min, idx))) = self.heap.peek()
             && size > min
         {
-            heap.pop();
-            slots[idx] = (p.to_path_buf(), node);
-            heap.push(Reverse((size, idx)));
+            self.heap.pop();
+            self.slots[idx] = (parent.join(node.name.as_str()), node);
+            self.heap.push(Reverse((size, idx)));
         }
-    });
-    let mut out: Vec<Entry> = slots.iter().map(|(p, n)| Entry::from_node(p, n)).collect();
-    out.sort_unstable_by_key(|e| Reverse(e.size_by(mode)));
-    out
+    }
+
+    fn into_entries(self, mode: SizeMode) -> Vec<Entry> {
+        let mut out: Vec<Entry> = self
+            .slots
+            .iter()
+            .map(|(p, n)| Entry::from_node(p, n))
+            .collect();
+        out.sort_unstable_by_key(|e| Reverse(e.size_by(mode)));
+        out
+    }
 }
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
@@ -157,24 +326,42 @@ impl ExtensionStat {
 
 /// Total size per file extension, largest first.
 pub fn by_extension(root: &Node, n: usize, mode: SizeMode) -> Vec<ExtensionStat> {
-    let mut map: HashMap<String, ExtensionStat> = HashMap::new();
-    root.walk(Path::new(""), &mut |_, node| {
-        if node.kind == NodeKind::File {
-            let e = map
-                .entry(extension(&node.name))
-                .or_insert_with_key(|k| ExtensionStat {
-                    extension: k.clone(),
-                    disk_size: 0,
-                    size: 0,
-                    file_count: 0,
-                });
-            e.disk_size += node.disk_size;
-            e.size += node.size;
-            e.file_count += 1;
+    let mut stats: Vec<ExtensionStat> = Vec::new();
+    // Extension -> index into `stats`. Looked up with a borrowed &str so the
+    // common case (an extension we have already seen) allocates nothing.
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut add = |buf_key: &str, node: &Node| match index.get(buf_key) {
+        Some(&i) => {
+            let s = &mut stats[i];
+            s.disk_size += node.disk_size;
+            s.size += node.size;
+            s.file_count += 1;
+        }
+        None => {
+            index.insert(buf_key.to_owned(), stats.len());
+            stats.push(ExtensionStat {
+                extension: buf_key.to_owned(),
+                disk_size: node.disk_size,
+                size: node.size,
+                file_count: 1,
+            });
+        }
+    };
+    let mut buf = [0u8; EXT_BUF];
+    visit_files(root, &mut |node| {
+        let name = node.name.as_str();
+        match lower_ext(name, &mut buf) {
+            Some(ext) => add(ext, node),
+            None => add(&extension(name), node),
         }
     });
-    let mut out: Vec<_> = map.into_values().collect();
-    out.sort_unstable_by_key(|s| Reverse(s.size_by(mode)));
+    let mut out = stats;
+    // Sorted by size; ties by extension so the output is stable between runs.
+    out.sort_unstable_by(|a, b| {
+        b.size_by(mode)
+            .cmp(&a.size_by(mode))
+            .then_with(|| a.extension.cmp(&b.extension))
+    });
     out.truncate(n);
     out
 }
@@ -212,18 +399,13 @@ pub fn by_age(root: &Node) -> Vec<AgeStat> {
             file_count: 0,
         })
         .collect();
-    root.walk(Path::new(""), &mut |_, node| {
-        if node.kind != NodeKind::File {
-            return;
-        }
-        let idx = match node.age() {
-            Some(a) => {
-                let days = a.as_secs() / DAY;
-                AGE_BUCKETS
-                    .iter()
-                    .position(|(_, max)| days < *max)
-                    .unwrap_or(AGE_BUCKETS.len() - 1)
-            }
+    let now = unix_now();
+    visit_files(root, &mut |node| {
+        let idx = match node_age_days(node, now) {
+            Some(days) => AGE_BUCKETS
+                .iter()
+                .position(|(_, max)| days < *max)
+                .unwrap_or(AGE_BUCKETS.len() - 1),
             // No timestamp, or modified in the future.
             None => AGE_BUCKETS.len(),
         };
@@ -271,6 +453,40 @@ mod tests {
     }
 
     #[test]
+    fn fast_extension_matches_std() {
+        for name in [
+            "a.txt",
+            "a",
+            ".gitignore",
+            "..",
+            ".",
+            "a.",
+            "a.b.c",
+            ".a.b",
+            "a/b.txt",
+            "a.b/c",
+            "(none)",
+            "x.(none)",
+            "UPPER.TXT",
+            "näme.äö",
+            "trailing.",
+            "....",
+            "a..b",
+        ] {
+            let std_ext = Path::new(name)
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_else(|| NO_EXT.into());
+            assert_eq!(extension(name), std_ext, "name {name:?}");
+            let mut buf = [0u8; EXT_BUF];
+            match lower_ext(name, &mut buf) {
+                Some(fast) => assert_eq!(fast, std_ext, "name {name:?}"),
+                None => assert!(std_ext.len() > EXT_BUF || !std_ext.is_ascii()),
+            }
+        }
+    }
+
+    #[test]
     fn filters_and_top_n() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
@@ -315,6 +531,37 @@ mod tests {
     }
 
     #[test]
+    fn nested_paths_and_extension_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        fs::create_dir_all(p.join("a/b/c")).unwrap();
+        fs::write(p.join("a/b/c/deep.TXT"), vec![1u8; 4_000]).unwrap();
+        fs::write(p.join("a/one.txt"), vec![1u8; 3_000]).unwrap();
+        fs::write(p.join("a/noext"), vec![1u8; 2_000]).unwrap();
+        let s = scan(p, &ScanOptions::default()).unwrap();
+        let m = SizeMode::Apparent;
+
+        let top = largest_files(&s.tree, &s.root, 1, &FileFilter::default(), m);
+        assert_eq!(top.len(), 1);
+        assert_eq!(
+            top[0].path,
+            s.root.join("a").join("b").join("c").join("deep.TXT")
+        );
+
+        let stats = by_extension(&s.tree, 10, m);
+        assert_eq!(stats[0].extension, "txt");
+        assert_eq!(stats[0].file_count, 2);
+        assert_eq!(stats[0].size, 7_000);
+        assert_eq!(stats[1].extension, "(none)");
+        assert_eq!(stats[1].file_count, 1);
+
+        let nested = s.tree.find(Path::new("a")).unwrap();
+        let from_sub = largest_files(nested, &s.root.join("a"), 10, &FileFilter::default(), m);
+        assert_eq!(from_sub.len(), 3);
+        assert!(from_sub[0].path.ends_with("deep.TXT"));
+    }
+
+    #[test]
     fn future_mtime_is_new() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("future");
@@ -334,6 +581,39 @@ mod tests {
         assert_eq!(
             largest_files(&s.tree, &s.root, 10, &new, SizeMode::Disk).len(),
             1
+        );
+    }
+
+    #[test]
+    fn age_filters_use_whole_days() {
+        // A file exactly 10 days old is "10 days" for both filters.
+        let now = unix_now();
+        let node = |mtime: u32| {
+            let mut n = Node::new(NodeKind::File, "f".into(), 1, 1, mtime);
+            n.set_counts(1, 0, 0);
+            n
+        };
+        let ten_days = now - 10 * DAY as i64;
+        let f = FileFilter {
+            older_than_days: Some(10),
+            ..Default::default()
+        };
+        assert!(f.matches(&node(ten_days as u32), SizeMode::Disk));
+        assert!(!f.matches(&node(ten_days as u32 + 1), SizeMode::Disk));
+        let f = FileFilter {
+            newer_than_days: Some(10),
+            ..Default::default()
+        };
+        assert!(!f.matches(&node(ten_days as u32), SizeMode::Disk));
+        assert!(f.matches(&node(ten_days as u32 + 1), SizeMode::Disk));
+        // Unknown timestamps match neither filter.
+        let unknown = node(NO_TIME);
+        assert!(
+            !FileFilter {
+                older_than_days: Some(0),
+                ..Default::default()
+            }
+            .matches(&unknown, SizeMode::Disk)
         );
     }
 }

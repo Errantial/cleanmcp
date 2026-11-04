@@ -58,7 +58,7 @@ The CLI and MCP server both call `cleanmcp-core`, so their answers always match.
 - [x] Skip virtual filesystems on Linux by default (`/proc`, `/sys`, `/dev`, `/run`); `--include-virtual` to override
 - [x] Exclude globs (`--exclude`). *Dropped "max depth during scan": it would make directory totals wrong; use `tree -d` to limit display depth instead.*
 - [x] Progress line on stderr (entries, bytes, entries/s); `ScanControl` gives counters + cancel to library users (MCP). Ctrl-C in the CLI simply exits
-- [x] Memory: compact 80-byte `Node` with inline `CompactString` names instead of an arena: measured 101 B/entry peak on 8.6M entries (was 122). An arena is left for the optimization pass if needed
+- [x] Memory: compact `Node` with inline `CompactString` names instead of an arena: measured 101 B/entry peak on 8.6M entries (was 122); the post-0.1.0 pass shrank the node to 64 bytes and reached 83 B/entry (see `docs/benchmarks.md`)
 - [x] Benchmarks recorded in `docs/benchmarks.md` (comparison with `dua`/`dust`/`gdu` deferred to the optimization pass)
 
 ### Milestone 2: TreeSize features

@@ -7,6 +7,7 @@ use anyhow::Result;
 use bytesize::ByteSize;
 use cleanmcp_core::drives::Drive;
 use cleanmcp_core::dupes::DuplicateGroup;
+use cleanmcp_core::jsonwrite::{push_str, push_u64};
 use cleanmcp_core::query::{AgeStat, Entry, ExtensionStat, format_time};
 use cleanmcp_core::rules::{Candidate, Rule};
 use cleanmcp_core::snapshot::DiffNode;
@@ -39,8 +40,8 @@ pub fn print_tree(s: &Scan, depth: usize, top: usize, mode: SizeMode) {
         "{} {label}  {}  ({} files, {} dirs, {} ms)",
         human(s.tree.size_by(mode)),
         s.root.display(),
-        s.tree.file_count,
-        s.tree.dir_count,
+        s.tree.file_count(),
+        s.tree.dir_count(),
         s.elapsed_ms
     );
     print_children(&s.tree, "", depth, top, mode);
@@ -48,10 +49,10 @@ pub fn print_tree(s: &Scan, depth: usize, top: usize, mode: SizeMode) {
 
 pub fn print_scan_notes(s: &Scan) {
     let st = &s.stats;
-    if s.tree.errors > 0 {
+    if s.tree.errors() > 0 {
         eprintln!(
             "note: {} entries could not be read (permission denied?)",
-            s.tree.errors
+            s.tree.errors()
         );
     }
     if st.hardlinks_deduped > 0 {
@@ -89,7 +90,7 @@ fn print_children(node: &Node, indent: &str, depth: usize, top: usize, mode: Siz
         } else {
             ("├─ ", "│  ")
         };
-        let suffix = match c.kind {
+        let suffix = match c.kind() {
             NodeKind::Dir => "/",
             NodeKind::Link => " ->",
             _ => "",
@@ -216,9 +217,9 @@ impl TreeJson {
             disk_size: node.disk_size,
             size: node.size,
             is_dir: node.is_dir(),
-            file_count: node.file_count as u64,
+            file_count: node.file_count() as u64,
             age_days: node.age().map(|d| d.as_secs() / 86_400),
-            errors: node.errors,
+            errors: node.errors(),
             other_disk_size,
             other_count,
             children,
@@ -367,17 +368,58 @@ pub struct ExportOptions {
     pub mode: SizeMode,
 }
 
+/// Rows are collected into one buffer and written in large chunks: an
+/// individual `write` per field is the main cost of exporting hundreds of
+/// thousands of rows (in JSON also through the `serde_json` formatter).
+const EXPORT_CHUNK: usize = 256 * 1024;
+
+struct ChunkedWriter<'a> {
+    out: &'a mut dyn Write,
+    buf: Vec<u8>,
+}
+
+impl<'a> ChunkedWriter<'a> {
+    fn new(out: &'a mut dyn Write) -> Self {
+        Self {
+            out,
+            buf: Vec::with_capacity(EXPORT_CHUNK + 1024),
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    fn flush_if_full(&mut self) -> std::io::Result<()> {
+        if self.buf.len() >= EXPORT_CHUNK {
+            self.out.write_all(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            self.out.write_all(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
 fn export_rows(
     s: &Scan,
     o: &ExportOptions,
-    mut f: impl FnMut(&Path, &Node) -> std::io::Result<()>,
+    out: &mut ChunkedWriter<'_>,
+    mut row: impl FnMut(&mut Vec<u8>, &Path, &Node),
 ) -> std::io::Result<()> {
     let mut result = Ok(());
     s.tree.walk(&s.root, &mut |p, n| {
         if result.is_err() || (o.dirs_only && !n.is_dir()) || n.size_by(o.mode) < o.min_size {
             return;
         }
-        result = f(p, n);
+        row(&mut out.buf, p, n);
+        result = out.flush_if_full();
     });
     result
 }
@@ -391,68 +433,206 @@ fn kind_str(k: NodeKind) -> &'static str {
     }
 }
 
-fn csv_field(s: &str) -> String {
-    if s.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
+fn push_csv_field(buf: &mut Vec<u8>, s: &str) {
+    if s.bytes()
+        .any(|b| b == b',' || b == b'"' || b == b'\n' || b == b'\r')
+    {
+        buf.push(b'"');
+        for &b in s.as_bytes() {
+            if b == b'"' {
+                buf.push(b'"');
+            }
+            buf.push(b);
+        }
+        buf.push(b'"');
     } else {
-        s.to_string()
+        buf.extend_from_slice(s.as_bytes());
     }
 }
 
 pub fn export_csv(s: &Scan, o: &ExportOptions, w: &mut dyn Write) -> Result<()> {
-    writeln!(
-        w,
-        "path,kind,disk_size,size,file_count,dir_count,modified_utc"
-    )?;
-    export_rows(s, o, |p, n| {
-        writeln!(
-            w,
-            "{},{},{},{},{},{},{}",
-            csv_field(&p.to_string_lossy()),
-            kind_str(n.kind),
-            n.disk_size,
-            n.size,
-            n.file_count,
-            n.dir_count,
-            n.modified()
-                .map(|_| format_time(n.mtime))
-                .unwrap_or_default()
-        )
+    let mut out = ChunkedWriter::new(w);
+    out.push(b"path,kind,disk_size,size,file_count,dir_count,modified_utc\n");
+    export_rows(s, o, &mut out, |buf, p, n| {
+        push_csv_field(buf, &p.to_string_lossy());
+        buf.push(b',');
+        buf.extend_from_slice(kind_str(n.kind()).as_bytes());
+        buf.push(b',');
+        push_u64(buf, n.disk_size);
+        buf.push(b',');
+        push_u64(buf, n.size);
+        buf.push(b',');
+        push_u64(buf, n.file_count() as u64);
+        buf.push(b',');
+        push_u64(buf, n.dir_count() as u64);
+        buf.push(b',');
+        if n.modified().is_some() {
+            buf.extend_from_slice(format_time(n.mtime_unix()).as_bytes());
+        }
+        buf.push(b'\n');
     })?;
+    out.finish()?;
     Ok(())
-}
-
-#[derive(Serialize)]
-struct ExportRow {
-    /// Lossy for non-UTF-8 names, so one odd file cannot abort the export.
-    path: String,
-    kind: &'static str,
-    disk_size: u64,
-    size: u64,
-    file_count: u32,
-    dir_count: u32,
-    modified_utc: Option<String>,
 }
 
 pub fn export_json(s: &Scan, o: &ExportOptions, w: &mut dyn Write) -> Result<()> {
-    w.write_all(b"[\n")?;
+    let mut out = ChunkedWriter::new(w);
+    out.push(b"[\n");
     let mut first = true;
-    export_rows(s, o, |p, n| {
+    export_rows(s, o, &mut out, |buf, p, n| {
         if !first {
-            w.write_all(b",\n")?;
+            buf.extend_from_slice(b",\n");
         }
         first = false;
-        let row = ExportRow {
-            path: p.to_string_lossy().into_owned(),
-            kind: kind_str(n.kind),
-            disk_size: n.disk_size,
-            size: n.size,
-            file_count: n.file_count,
-            dir_count: n.dir_count,
-            modified_utc: n.modified().map(|_| format_time(n.mtime)),
-        };
-        serde_json::to_writer(&mut *w, &row).map_err(std::io::Error::other)
+        buf.extend_from_slice(b"{\"path\":");
+        // Lossy for non-UTF-8 names, so one odd file cannot abort the export.
+        push_str(buf, &p.to_string_lossy());
+        buf.extend_from_slice(b",\"kind\":\"");
+        buf.extend_from_slice(kind_str(n.kind()).as_bytes());
+        buf.extend_from_slice(b"\",\"disk_size\":");
+        push_u64(buf, n.disk_size);
+        buf.extend_from_slice(b",\"size\":");
+        push_u64(buf, n.size);
+        buf.extend_from_slice(b",\"file_count\":");
+        push_u64(buf, n.file_count() as u64);
+        buf.extend_from_slice(b",\"dir_count\":");
+        push_u64(buf, n.dir_count() as u64);
+        buf.extend_from_slice(b",\"modified_utc\":");
+        match n.modified() {
+            Some(_) => push_str(buf, &format_time(n.mtime_unix())),
+            None => buf.extend_from_slice(b"null"),
+        }
+        buf.push(b'}');
     })?;
-    w.write_all(b"\n]\n")?;
+    out.push(b"\n]\n");
+    out.finish()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cleanmcp_core::scan::{ScanOptions, scan};
+    use std::fs;
+
+    /// `"` is illegal in Windows file names, so the quote-doubling case is unix-only.
+    fn odd_name() -> &'static str {
+        if cfg!(unix) {
+            "a,b\"c.txt"
+        } else {
+            "a,b c.txt"
+        }
+    }
+
+    fn sample_scan() -> (tempfile::TempDir, Scan) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("d");
+        fs::create_dir_all(p.join("sub")).unwrap();
+        fs::write(p.join(odd_name()), vec![1u8; 300]).unwrap();
+        fs::write(p.join("sub").join("file.txt"), vec![1u8; 100]).unwrap();
+        let s = scan(&p, &ScanOptions::default()).unwrap();
+        (dir, s)
+    }
+
+    fn opts() -> ExportOptions {
+        ExportOptions {
+            dirs_only: false,
+            min_size: 0,
+            mode: SizeMode::Disk,
+        }
+    }
+
+    #[test]
+    fn csv_rows_are_escaped_and_complete() {
+        let (_dir, s) = sample_scan();
+        let mut out = Vec::new();
+        export_csv(&s, &opts(), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "path,kind,disk_size,size,file_count,dir_count,modified_utc"
+        );
+        // header, root, sub, two files
+        assert_eq!(lines.len(), 5, "{text}");
+        let row = lines
+            .iter()
+            // CSV doubles an embedded quote, so search for the escaped form.
+            .find(|l| l.contains(&odd_name().replace('"', "\"\"")))
+            .expect("file row");
+        // The whole path is quoted because it contains a comma.
+        assert!(row.starts_with('"'), "not CSV-quoted: {row}");
+        if cfg!(unix) {
+            assert!(row.contains("\"\""), "quote not doubled: {row}");
+        }
+        let node = s.find(Path::new(odd_name())).unwrap();
+        assert!(
+            row.ends_with(&format!(
+                ",file,{},300,1,0,{}",
+                node.disk_size,
+                format_time(node.mtime_unix())
+            )),
+            "{row}"
+        );
+    }
+
+    /// The old exporter serialized this struct with `serde_json`, one compact
+    /// object per line. Comparing against it keeps the key names, their order
+    /// and the `null` for unknown times byte-identical.
+    #[derive(Serialize)]
+    struct OldExportRow {
+        path: String,
+        kind: String,
+        disk_size: u64,
+        size: u64,
+        file_count: u32,
+        dir_count: u32,
+        modified_utc: Option<String>,
+    }
+
+    #[test]
+    fn json_rows_match_old_serde_json_output() {
+        let (_dir, s) = sample_scan();
+        let mut out = Vec::new();
+        export_json(&s, &opts(), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("[\n") && text.ends_with("\n]\n"));
+        let mut rows = 0;
+        for line in text.lines().filter(|l| l.starts_with('{')) {
+            let line = line.trim_end_matches(',');
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let expected = serde_json::to_string(&OldExportRow {
+                path: v["path"].as_str().unwrap().to_string(),
+                kind: v["kind"].as_str().unwrap().to_string(),
+                disk_size: v["disk_size"].as_u64().unwrap(),
+                size: v["size"].as_u64().unwrap(),
+                file_count: v["file_count"].as_u64().unwrap() as u32,
+                dir_count: v["dir_count"].as_u64().unwrap() as u32,
+                modified_utc: v["modified_utc"].as_str().map(str::to_string),
+            })
+            .unwrap();
+            assert_eq!(line, expected);
+            assert_eq!(v.as_object().unwrap().len(), 7);
+            rows += 1;
+        }
+        assert_eq!(rows, 4, "{text}");
+    }
+
+    #[test]
+    fn export_filters_dirs_and_small_entries() {
+        let (_dir, s) = sample_scan();
+        let o = ExportOptions {
+            dirs_only: true,
+            min_size: 150,
+            mode: SizeMode::Apparent,
+        };
+        let mut out = Vec::new();
+        export_csv(&s, &o, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        // The root (400 bytes) is the only dir at or above 150; `sub` (100) is
+        // dropped and files are excluded by `dirs_only`.
+        let rows: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(rows.len(), 1, "{text}");
+        assert!(rows[0].contains(",dir,"), "{text}");
+    }
 }

@@ -450,7 +450,7 @@ fn main() -> Result<()> {
             snapshot::save(&s, &out).with_context(|| format!("cannot write {}", out.display()))?;
             eprintln!(
                 "Saved {} entries ({} on disk) to {}",
-                s.tree.file_count as u64 + s.tree.dir_count as u64,
+                s.tree.file_count() as u64 + s.tree.dir_count() as u64,
                 output::human(s.tree.disk_size),
                 out.display()
             );
@@ -466,24 +466,44 @@ fn main() -> Result<()> {
             json,
         } => {
             let cfg = config()?;
-            let old_scan =
-                snapshot::load(&old).with_context(|| format!("cannot read {}", old.display()))?;
-            let new_scan = match new {
-                Some(p) if p.is_file() => {
-                    snapshot::load(&p).with_context(|| format!("cannot read {}", p.display()))?
-                }
+            let header = snapshot::read_header(&old)
+                .with_context(|| format!("cannot read {}", old.display()))?;
+            let mode = if apparent {
+                SizeMode::Apparent
+            } else {
+                SizeMode::Disk
+            };
+            // Only the first `depth` levels are ever looked at, so the snapshot
+            // is loaded truncated; that keeps the second tree small. When the
+            // other side has to be rescanned, loading and scanning run at the
+            // same time.
+            let (old_scan, new_scan) = match new {
+                Some(p) if p.is_file() => (
+                    snapshot::load_truncated(&old, depth)
+                        .with_context(|| format!("cannot read {}", old.display()))?,
+                    snapshot::load_truncated(&p, depth)
+                        .with_context(|| format!("cannot read {}", p.display()))?,
+                ),
                 other => {
-                    let path = other.unwrap_or_else(|| old_scan.root.clone());
+                    let path = other.unwrap_or_else(|| header.root.clone());
                     if !path.is_dir() {
                         bail!("{} is not a snapshot file or directory", path.display());
                     }
-                    let mut opts = ScanOptions::from_settings(&old_scan.settings);
+                    let mut opts = ScanOptions::from_settings(&header.settings);
                     for e in &cfg.exclude {
                         if !opts.exclude.contains(e) {
                             opts.exclude.push(e.clone());
                         }
                     }
-                    run_scan(&path, opts, quiet)?
+                    std::thread::scope(|scope| {
+                        let loader = scope.spawn(|| snapshot::load_truncated(&old, depth));
+                        let new_scan = run_scan(&path, opts, quiet)?;
+                        let old_scan = loader
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("snapshot loader thread panicked"))?
+                            .with_context(|| format!("cannot read {}", old.display()))?;
+                        Ok::<_, anyhow::Error>((old_scan, new_scan))
+                    })?
                 }
             };
             if old_scan.root != new_scan.root {
@@ -498,11 +518,6 @@ fn main() -> Result<()> {
                     "warning: the two scans used different options (exclude, --one-filesystem, ...)"
                 );
             }
-            let mode = if apparent {
-                SizeMode::Apparent
-            } else {
-                SizeMode::Disk
-            };
             let d = snapshot::diff(
                 &old_scan.tree,
                 &new_scan.tree,
