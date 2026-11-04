@@ -468,7 +468,7 @@ mod tests {
             "(none)",
             "x.(none)",
             "UPPER.TXT",
-            "nÃƒÂ¤me.Ãƒâ€žÃƒâ€“ÃƒÅ“",
+            "näme.äö",
             "trailing.",
             "....",
             "a..b",

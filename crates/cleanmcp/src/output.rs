@@ -86,9 +86,9 @@ fn print_children(node: &Node, indent: &str, depth: usize, top: usize, mode: Siz
     for (i, c) in children.iter().take(top).enumerate() {
         let last = i + 1 == shown && !more;
         let (branch, next) = if last {
-            ("ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ ", "   ")
+            ("└─ ", "   ")
         } else {
-            ("ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ ", "ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡  ")
+            ("├─ ", "│  ")
         };
         let suffix = match c.kind() {
             NodeKind::Dir => "/",
@@ -108,7 +108,7 @@ fn print_children(node: &Node, indent: &str, depth: usize, top: usize, mode: Siz
     if more {
         let rest: u64 = children[top..].iter().map(|c| c.size_by(mode)).sum();
         println!(
-            "{indent}ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ {:>10} {:>5.1}%  ({} more)",
+            "{indent}└─ {:>10} {:>5.1}%  ({} more)",
             human(rest),
             pct(rest, total),
             children.len() - top
@@ -336,9 +336,9 @@ fn print_diff_children(d: &DiffNode, indent: &str) {
     for (i, c) in d.children.iter().enumerate() {
         let last = i + 1 == n && d.more == 0;
         let (branch, next) = if last {
-            ("ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ ", "   ")
+            ("└─ ", "   ")
         } else {
-            ("ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ ", "ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡  ")
+            ("├─ ", "│  ")
         };
         let name = c
             .path
@@ -358,7 +358,7 @@ fn print_diff_children(d: &DiffNode, indent: &str) {
         print_diff_children(c, &format!("{indent}{next}"));
     }
     if d.more > 0 {
-        println!("{indent}ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ ({} more changed)", d.more);
+        println!("{indent}└─ ({} more changed)", d.more);
     }
 }
 

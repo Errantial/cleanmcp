@@ -721,7 +721,7 @@ mod tests {
         // Quotes and backslashes are illegal in Windows file names, so the
         // escape-heavy cases are unix-only; `jsonwrite` and the old-snapshot
         // fixture cover escaping on both platforms.
-        let mut names = vec!["hÃ©llo ðŸš€", "comma,name", "sp ace"];
+        let mut names = vec!["héllo 🚀", "comma,name", "sp ace"];
         if cfg!(unix) {
             names.push("quote\"inside");
             names.push("back\\slash");
@@ -839,7 +839,7 @@ mod tests {
         fs::create_dir_all(&p).unwrap();
         // `"` is not a legal Windows file name; the unicode name still checks
         // the common path on both platforms.
-        let name = if cfg!(unix) { "quo\"te Ã©" } else { "quo Ã©" };
+        let name = if cfg!(unix) { "quo\"te é" } else { "quo é" };
         fs::write(p.join(name), vec![1u8; 8]).unwrap();
         let s = scan(&p, &ScanOptions::default()).unwrap();
         let node = s.find(Path::new(name)).unwrap();

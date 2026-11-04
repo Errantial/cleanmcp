@@ -351,7 +351,7 @@ impl App {
                 Style::new().bold(),
             )]),
             Line::from(format!(
-                "{} {mode} Â· {} files Â· {} dirs Â· sorted by {}",
+                "{} {mode} · {} files · {} dirs · sorted by {}",
                 human(total),
                 node.file_count(),
                 node.dir_count(),
@@ -369,7 +369,7 @@ impl App {
                 let size = c.size_by(self.mode);
                 let share = pct(size, total);
                 let filled = ((share / 10.0).round() as usize).min(10);
-                let bar = format!("{}{}", "â–ˆ".repeat(filled), "â–‘".repeat(10 - filled));
+                let bar = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
                 let marked = self.marked.contains(&base.join(c.name.as_str()));
                 let age = c
                     .age()
@@ -385,7 +385,7 @@ impl App {
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(
-                        if marked { "â— " } else { "  " },
+                        if marked { "▸ " } else { "  " },
                         Style::new().fg(Color::Yellow),
                     ),
                     Span::raw(format!("{:>10} ", human(size))),
@@ -410,7 +410,7 @@ impl App {
             String::new()
         } else {
             format!(
-                "{} marked ({}) Â· ",
+                "{} marked ({}) · ",
                 self.marked.len(),
                 human(self.marked_size())
             )
@@ -418,7 +418,7 @@ impl App {
         let foot = vec![
             Line::from(format!("{marked}{}", self.status)),
             Line::from(
-                "â†‘â†“ move  âŽ/â†’ open  â†/âŒ« up  space mark  d trash  o reveal  s sort  a size mode  ? help  q quit",
+                "↑↓ move  ⏎/→ open  ←/⌫ up  space mark  d trash  o reveal  s sort  a size mode  ? help  q quit",
             )
             .dark_gray(),
         ];
@@ -453,8 +453,8 @@ impl App {
             popup(f, "Confirm", lines);
         } else if self.help {
             let lines = [
-                "â†‘/â†“ j/k        move          PgUp/PgDn, g/G  jump",
-                "Enter/â†’/l      open folder   â†/Backspace/h   go up",
+                "↑/↓ j/k        move          PgUp/PgDn, g/G  jump",
+                "Enter/→/l      open folder   ←/Backspace/h   go up",
                 "space          mark/unmark   u               clear marks",
                 "d / Delete     move marked (or selected) items to the trash",
                 "o              show in Explorer / file manager",

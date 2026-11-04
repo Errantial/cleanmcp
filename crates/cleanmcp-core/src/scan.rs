@@ -414,14 +414,14 @@ mod tests {
     #[test]
     fn unicode_and_long_names() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("hÃ©llo wÃ¶rld â€” Ã¼nÃ¯code.txt"), b"hi").unwrap();
-        fs::write(dir.path().join("ðŸ˜€ emoji.txt"), b"hey").unwrap();
+        fs::write(dir.path().join("héllo wörld - ünicode.txt"), b"hi").unwrap();
+        fs::write(dir.path().join("🚀 emoji.txt"), b"hey").unwrap();
         fs::write(dir.path().join("n".repeat(200)), b"x").unwrap();
         let s = scan(dir.path(), &opts()).unwrap();
         assert_eq!(s.tree.file_count(), 3);
         assert_eq!(s.tree.size, 6);
-        assert!(s.find(Path::new("hÃ©llo wÃ¶rld â€” Ã¼nÃ¯code.txt")).is_some());
-        assert!(s.find(Path::new("ðŸ˜€ emoji.txt")).is_some());
+        assert!(s.find(Path::new("héllo wörld - ünicode.txt")).is_some());
+        assert!(s.find(Path::new("🚀 emoji.txt")).is_some());
         assert!(s.find(Path::new(&"n".repeat(200))).is_some());
     }
 
