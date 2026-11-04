@@ -45,6 +45,11 @@ CLI flags are unchanged.
   instead of a bare array, so a truncated page no longer hides how many groups exist or what they
   total. Every group also reports `disk_size` and `wasted_disk_size`; the MCP `find_duplicates`
   groups gain those two fields (additive) and keep their logical totals.
+- `tree --json` nodes gained `children_truncated` (the depth limit or `top` left children out, so
+  an empty `children` list no longer looks like an empty folder) and `other_size` (the omitted
+  children in the selected size mode). Omitted-children totals now also cover folders below the
+  depth limit, not only the tail cut by `top`. `list_children` in the MCP server shares this shape,
+  so it gains both fields and reports the omitted children at its depth limit too.
 - An explicit `--config` path that does not exist now errors instead of silently using defaults.
 
 ### Build

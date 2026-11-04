@@ -178,9 +178,18 @@ pub struct TreeJson {
     pub file_count: u64,
     pub age_days: Option<u64>,
     pub errors: u32,
-    /// Children beyond the `top` limit are summed into `other_disk_size`.
+    /// Space used on disk by the children this node did not list: the ones
+    /// beyond `top`, or all of them when the depth limit stopped the walk.
     pub other_disk_size: u64,
+    /// The same omitted children, in the requested size mode.
+    pub other_size: u64,
+    /// Children this node did not list (beyond `top`, or all of them when the
+    /// depth limit stopped the walk).
     pub other_count: usize,
+    /// `true` when the folder has children that are not in `children` (depth
+    /// limit or `top`), so an empty `children` does not mean an empty folder.
+    /// Files and genuinely empty folders are never truncated.
+    pub children_truncated: bool,
     pub children: Vec<TreeJson>,
 }
 
@@ -199,8 +208,21 @@ impl TreeJson {
         offset: usize,
         mode: SizeMode,
     ) -> Self {
-        let (children, other_disk_size, other_count) = if depth == 0 {
-            (Vec::new(), 0, 0)
+        let (children, other_disk_size, other_size, other_count, children_truncated) = if depth == 0
+        {
+            if node.children().is_empty() {
+                (Vec::new(), 0, 0, 0, false)
+            } else {
+                // The depth limit stopped the walk here. The node's rolled-up
+                // totals are exactly its (unlisted) children's totals.
+                (
+                    Vec::new(),
+                    node.disk_size,
+                    node.size_by(mode),
+                    node.children().len(),
+                    true,
+                )
+            }
         } else {
             let sorted = node.sorted_children(mode);
             let start = offset.min(sorted.len());
@@ -210,7 +232,13 @@ impl TreeJson {
                 .map(|c| TreeJson::build(c, &path.join(c.name.as_str()), depth - 1, top, mode))
                 .collect();
             let rest = sorted.get(start + top..).unwrap_or_default();
-            (kids, rest.iter().map(|c| c.disk_size).sum(), rest.len())
+            (
+                kids,
+                rest.iter().map(|c| c.disk_size).sum(),
+                rest.iter().map(|c| c.size_by(mode)).sum(),
+                rest.len(),
+                !rest.is_empty(),
+            )
         };
         TreeJson {
             path: path.to_path_buf(),
@@ -221,7 +249,9 @@ impl TreeJson {
             age_days: node.age().map(|d| d.as_secs() / 86_400),
             errors: node.errors(),
             other_disk_size,
+            other_size,
             other_count,
+            children_truncated,
             children,
         }
     }
@@ -584,6 +614,87 @@ mod tests {
             min_size: 0,
             mode: SizeMode::Disk,
         }
+    }
+
+    fn file_node(name: &str, size: u64, disk: u64) -> Node {
+        let mut n = Node::new(NodeKind::File, name.into(), size, disk, 0);
+        n.set_counts(1, 0, 0);
+        n
+    }
+
+    fn dir_node(name: &str, children: Vec<Node>) -> Node {
+        let size = children.iter().map(|c| c.size).sum();
+        let disk = children.iter().map(|c| c.disk_size).sum();
+        let files = children.iter().map(|c| c.file_count()).sum();
+        let dirs = children
+            .iter()
+            .map(|c| c.dir_count() + u32::from(c.is_dir()))
+            .sum();
+        let mut n = Node::new(NodeKind::Dir, name.into(), size, disk, 0);
+        n.set_children(children);
+        n.set_counts(files, dirs, 0);
+        n
+    }
+
+    #[test]
+    fn tree_json_marks_depth_truncation_and_prices_omitted_children() {
+        let root = dir_node(
+            "root",
+            vec![
+                dir_node("empty", vec![]),
+                dir_node("full", vec![file_node("f", 100, 1_000)]),
+            ],
+        );
+        let path = Path::new("root");
+        fn child<'a>(t: &'a TreeJson, name: &str) -> &'a TreeJson {
+            t.children
+                .iter()
+                .find(|c| c.path.ends_with(name))
+                .unwrap_or_else(|| panic!("no child {name}"))
+        }
+
+        let t = TreeJson::build(&root, path, 1, 10, SizeMode::Apparent);
+        assert!(!t.children_truncated, "all children are listed");
+        assert!(!child(&t, "empty").children_truncated);
+        assert_eq!(child(&t, "empty").other_count, 0);
+
+        // `full` is a folder below the depth limit: not expanded, not empty.
+        let full = child(&t, "full");
+        assert!(full.children_truncated);
+        assert!(full.children.is_empty());
+        assert_eq!(full.other_count, 1);
+        assert_eq!(full.other_size, 100, "apparent size of the omitted file");
+        assert_eq!(full.other_disk_size, 1_000);
+
+        let t = TreeJson::build(&root, path, 1, 10, SizeMode::Disk);
+        let full = child(&t, "full");
+        assert_eq!(full.other_size, 1_000, "disk size in the default mode");
+        assert_eq!(full.other_disk_size, 1_000);
+    }
+
+    #[test]
+    fn tree_json_marks_a_truncated_tail() {
+        let root = dir_node(
+            "root",
+            vec![
+                file_node("a", 300, 3_000),
+                file_node("b", 200, 2_000),
+                file_node("c", 100, 1_000),
+            ],
+        );
+        let t = TreeJson::build(&root, Path::new("root"), 2, 2, SizeMode::Apparent);
+        assert_eq!(t.children.len(), 2);
+        assert!(t.children_truncated);
+        assert_eq!(t.other_count, 1);
+        assert_eq!(t.other_size, 100);
+        assert_eq!(t.other_disk_size, 1_000);
+        // Files are leaves even when the depth limit stops at them.
+        assert!(t.children.iter().all(|c| !c.children_truncated));
+
+        // All children shown: no truncation, no omitted totals.
+        let t = TreeJson::build(&root, Path::new("root"), 2, 3, SizeMode::Apparent);
+        assert!(!t.children_truncated);
+        assert_eq!((t.other_count, t.other_size, t.other_disk_size), (0, 0, 0));
     }
 
     fn dupe_group(
