@@ -24,7 +24,7 @@ use blake3::Hash;
 use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::tree::{Node, NodeKind};
+use crate::tree::{Node, NodeKind, SizeMode};
 
 /// Bytes hashed from the start and the end of a file in the quick pass.
 const PARTIAL: u64 = 16 * 1024;
@@ -39,13 +39,47 @@ const BUF: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct DuplicateGroup {
-    /// Size of each copy in bytes.
+    /// Logical size of each copy in bytes; identical content always has one length.
     pub size: u64,
-    /// Space freed by keeping one copy: `size * (copies - 1)`.
+    /// Allocated size on disk of the largest copy in bytes. Copies of identical
+    /// content usually have the same allocation, but sparse or compressed files
+    /// can differ; this is what one copy occupies on disk.
+    pub disk_size: u64,
+    /// Logical bytes freed by keeping one copy: `size * (copies - 1)`.
     pub wasted: u64,
+    /// Allocated bytes freed by keeping one copy: the total of all copies minus
+    /// the largest one. Never exceeds `disk_size * (copies - 1)`.
+    pub wasted_disk_size: u64,
     /// BLAKE3 hash of the content (hex).
     pub hash: String,
     pub paths: Vec<PathBuf>,
+}
+
+impl DuplicateGroup {
+    /// Size of one copy in `mode`.
+    pub fn size_by(&self, mode: SizeMode) -> u64 {
+        match mode {
+            SizeMode::Disk => self.disk_size,
+            SizeMode::Apparent => self.size,
+        }
+    }
+
+    /// Bytes freed by keeping one copy, in `mode`.
+    pub fn wasted_by(&self, mode: SizeMode) -> u64 {
+        match mode {
+            SizeMode::Disk => self.wasted_disk_size,
+            SizeMode::Apparent => self.wasted,
+        }
+    }
+}
+
+/// A file that may have duplicates: its path plus the allocation recorded by
+/// the scan, so groups can be priced with or without `--apparent`.
+#[derive(Debug, Clone)]
+pub struct DupeCandidate {
+    pub path: PathBuf,
+    /// Allocated size on disk in bytes, from the scan tree.
+    pub disk_size: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +109,11 @@ pub fn find_duplicates(root: &Node, base: &Path, opts: &DupeOptions) -> Vec<Dupl
 ///
 /// Sizes that only one file has are dropped before any path is built: on a big
 /// tree most files are unique, so this saves one allocation per file.
-pub fn same_size_files(root: &Node, base: &Path, opts: &DupeOptions) -> Vec<(u64, Vec<PathBuf>)> {
+pub fn same_size_files(
+    root: &Node,
+    base: &Path,
+    opts: &DupeOptions,
+) -> Vec<(u64, Vec<DupeCandidate>)> {
     let min = opts.min_size.max(1);
     let mut counts: HashMap<u64, u32> = HashMap::new();
     count_sizes(root, min, &mut counts);
@@ -83,12 +121,12 @@ pub fn same_size_files(root: &Node, base: &Path, opts: &DupeOptions) -> Vec<(u64
     if counts.is_empty() {
         return Vec::new();
     }
-    let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::with_capacity(counts.len());
+    let mut by_size: HashMap<u64, Vec<DupeCandidate>> = HashMap::with_capacity(counts.len());
     let mut path = base.to_path_buf();
     collect_paths(root, min, &counts, &mut path, &mut by_size);
     // Biggest files first: the hashing pass is I/O bound and this order gives the
     // long reads to the pool before the short ones.
-    let mut out: Vec<(u64, Vec<PathBuf>)> = by_size.into_iter().collect();
+    let mut out: Vec<(u64, Vec<DupeCandidate>)> = by_size.into_iter().collect();
     out.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
     out
 }
@@ -112,14 +150,17 @@ fn collect_paths(
     min: u64,
     counts: &HashMap<u64, u32>,
     path: &mut PathBuf,
-    out: &mut HashMap<u64, Vec<PathBuf>>,
+    out: &mut HashMap<u64, Vec<DupeCandidate>>,
 ) {
     for c in node.children() {
         match c.kind() {
             NodeKind::File => {
                 if c.size >= min && counts.contains_key(&c.size) {
                     path.push(c.name.as_str());
-                    out.entry(c.size).or_default().push(path.clone());
+                    out.entry(c.size).or_default().push(DupeCandidate {
+                        path: path.clone(),
+                        disk_size: c.disk_size,
+                    });
                     path.pop();
                 }
             }
@@ -134,37 +175,37 @@ fn collect_paths(
 }
 
 /// Hash same-size files (head/tail first, then fully) and return the real duplicates.
-pub fn hash_candidates(candidates: Vec<(u64, Vec<PathBuf>)>) -> Vec<DuplicateGroup> {
+pub fn hash_candidates(candidates: Vec<(u64, Vec<DupeCandidate>)>) -> Vec<DuplicateGroup> {
     let total: usize = candidates.iter().map(|(_, p)| p.len()).sum();
     if total < 2 {
         return Vec::new();
     }
-    // One flat list of (size, path) in biggest-file-first order.
+    // One flat list of (size, file) in biggest-file-first order.
     let mut sizes: Vec<u64> = Vec::with_capacity(total);
-    let mut paths: Vec<PathBuf> = Vec::with_capacity(total);
+    let mut files: Vec<DupeCandidate> = Vec::with_capacity(total);
     for (size, group) in candidates {
-        for p in group {
+        for f in group {
             sizes.push(size);
-            paths.push(p);
+            files.push(f);
         }
     }
 
     // Pass 2: quick hash. One small buffer per chunk, reused across the files in it.
-    let per_chunk = chunk_size(paths.len());
-    let keys: Vec<Option<(Hash, bool)>> = paths
+    let per_chunk = chunk_size(files.len());
+    let keys: Vec<Option<(Hash, bool)>> = files
         .par_chunks(per_chunk)
         .map(|chunk| {
             let mut buf = vec![0u8; 2 * PARTIAL as usize];
             chunk
                 .iter()
-                .map(|p| quick_key(p, &mut buf).ok())
+                .map(|f| quick_key(&f.path, &mut buf).ok())
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>()
         .concat();
 
     let mut groups: Vec<DuplicateGroup> = Vec::new();
-    let mut map: HashMap<(u64, Hash), Vec<(u32, bool)>> = HashMap::with_capacity(paths.len() / 2);
+    let mut map: HashMap<(u64, Hash), Vec<(u32, bool)>> = HashMap::with_capacity(files.len() / 2);
     for (i, key) in keys.iter().enumerate() {
         if let Some((key, whole)) = key {
             map.entry((sizes[i], *key))
@@ -181,13 +222,13 @@ pub fn hash_candidates(candidates: Vec<(u64, Vec<PathBuf>)>) -> Vec<DuplicateGro
         // Only skip the full pass when every member was hashed in full.
         if idxs.iter().all(|(_, whole)| *whole) {
             let idxs: Vec<u32> = idxs.into_iter().map(|(i, _)| i).collect();
-            groups.push(make_group(size, key, &paths, &idxs));
+            groups.push(make_group(size, key, &files, &idxs));
         } else {
             pending.push((size, idxs.into_iter().map(|(i, _)| i).collect()));
         }
     }
 
-    full_pass(&mut groups, pending, &sizes, &paths);
+    full_pass(&mut groups, pending, &sizes, &files);
 
     groups.sort_unstable_by(|a, b| b.wasted.cmp(&a.wasted).then_with(|| a.paths.cmp(&b.paths)));
     groups
@@ -212,7 +253,7 @@ fn full_pass(
     groups: &mut Vec<DuplicateGroup>,
     mut pending: Vec<(u64, Vec<u32>)>,
     sizes: &[u64],
-    paths: &[PathBuf],
+    files: &[DupeCandidate],
 ) {
     if pending.is_empty() {
         return;
@@ -247,11 +288,16 @@ fn full_pass(
             chunk
                 .iter()
                 .map(|t| match *t {
-                    Task::Hash { cand, .. } => hash_full(&paths[cand as usize], &mut buf).ok(),
+                    Task::Hash { cand, .. } => hash_full(&files[cand as usize].path, &mut buf).ok(),
                     Task::Pair { a, b, .. } => {
                         let other = other.get_or_insert_with(|| vec![0u8; BUF]);
-                        compare(&paths[a as usize], &paths[b as usize], &mut buf, other)
-                            .unwrap_or(None)
+                        compare(
+                            &files[a as usize].path,
+                            &files[b as usize].path,
+                            &mut buf,
+                            other,
+                        )
+                        .unwrap_or(None)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -273,7 +319,7 @@ fn full_pass(
 
     for (gi, (size, idxs)) in pending.iter().enumerate() {
         if let Some(hash) = compared[gi] {
-            groups.push(make_group(*size, hash, paths, idxs));
+            groups.push(make_group(*size, hash, files, idxs));
             continue;
         }
         let Some(found) = hashed[gi].take() else {
@@ -285,20 +331,25 @@ fn full_pass(
         }
         for (hash, idxs) in by_hash {
             if idxs.len() > 1 {
-                groups.push(make_group(*size, hash, paths, &idxs));
+                groups.push(make_group(*size, hash, files, &idxs));
             }
         }
     }
 }
 
-fn make_group(size: u64, hash: Hash, paths: &[PathBuf], idxs: &[u32]) -> DuplicateGroup {
-    let mut copies: Vec<PathBuf> = idxs.iter().map(|&i| paths[i as usize].clone()).collect();
-    copies.sort();
+fn make_group(size: u64, hash: Hash, files: &[DupeCandidate], idxs: &[u32]) -> DuplicateGroup {
+    let mut copies: Vec<&DupeCandidate> = idxs.iter().map(|&i| &files[i as usize]).collect();
+    copies.sort_by(|a, b| a.path.cmp(&b.path));
+    let total_disk: u64 = copies.iter().map(|c| c.disk_size).sum();
+    // Keep the largest copy: that is the least space any single copy can cost.
+    let disk_size = copies.iter().map(|c| c.disk_size).max().unwrap_or(0);
     DuplicateGroup {
         size,
+        disk_size,
         wasted: size * (copies.len() as u64 - 1),
+        wasted_disk_size: total_disk.saturating_sub(disk_size),
         hash: hash.to_hex().to_string(),
-        paths: copies,
+        paths: copies.iter().map(|c| c.path.clone()).collect(),
     }
 }
 
@@ -406,6 +457,13 @@ mod tests {
         v
     }
 
+    fn cand(path: impl Into<PathBuf>, disk_size: u64) -> DupeCandidate {
+        DupeCandidate {
+            path: path.into(),
+            disk_size,
+        }
+    }
+
     #[test]
     fn finds_identical_files_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -430,6 +488,12 @@ mod tests {
         assert_eq!(g[0].paths.len(), 2);
         assert!(g[0].paths.iter().all(|p| !p.ends_with("c")));
         assert_eq!(g[1].paths.len(), 2);
+        // The disk figures come from the scan, not from the logical length.
+        let a = s.find(Path::new("a")).unwrap().disk_size;
+        let b = s.find(Path::new("sub/b")).unwrap().disk_size;
+        assert_eq!(g[0].disk_size, a.max(b));
+        assert_eq!(g[0].wasted_disk_size, a.min(b));
+        assert_eq!(g[0].size_by(SizeMode::Apparent), 100_000);
     }
 
     #[test]
@@ -520,9 +584,18 @@ mod tests {
         let b = p.join("b");
 
         // A missing file never forms a group, alone or next to a real copy.
-        let g = hash_candidates(vec![(300_000, vec![missing.clone(), missing.clone()])]);
+        let g = hash_candidates(vec![(
+            300_000,
+            vec![
+                cand(missing.clone(), 300_000),
+                cand(missing.clone(), 300_000),
+            ],
+        )]);
         assert!(g.is_empty(), "{g:?}");
-        let g = hash_candidates(vec![(300_000, vec![a, b, missing])]);
+        let g = hash_candidates(vec![(
+            300_000,
+            vec![cand(a, 300_000), cand(b, 300_000), cand(missing, 300_000)],
+        )]);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].paths.len(), 2);
     }
@@ -535,10 +608,45 @@ mod tests {
         fs::write(p.join("a"), &body).unwrap();
         fs::hard_link(p.join("a"), p.join("link")).unwrap();
 
-        let g = hash_candidates(vec![(400_000, vec![p.join("a"), p.join("link")])]);
+        let g = hash_candidates(vec![(
+            400_000,
+            vec![cand(p.join("a"), 400_000), cand(p.join("link"), 400_000)],
+        )]);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].paths.len(), 2);
         assert_eq!(g[0].wasted, 400_000);
+        assert_eq!(g[0].wasted_disk_size, 400_000);
+    }
+
+    #[test]
+    fn logical_size_and_disk_size_are_reported_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = vec![5u8; 100];
+        let paths: Vec<PathBuf> = ["a", "b", "c"].iter().map(|n| dir.path().join(n)).collect();
+        for p in &paths {
+            fs::write(p, &body).unwrap();
+        }
+        // Allocations that the scan recorded: much bigger than the 100-byte
+        // length, and unequal because one copy is sparse or compressed.
+        let g = hash_candidates(vec![(
+            100,
+            vec![
+                cand(&paths[0], 8192),
+                cand(&paths[1], 4096),
+                cand(&paths[2], 4096),
+            ],
+        )]);
+        assert_eq!(g.len(), 1);
+        let group = &g[0];
+        assert_eq!(group.size, 100);
+        assert_eq!(group.wasted, 200);
+        // Keeping the largest copy frees the other two allocations.
+        assert_eq!(group.disk_size, 8192);
+        assert_eq!(group.wasted_disk_size, 8192);
+        assert_eq!(group.size_by(SizeMode::Apparent), 100);
+        assert_eq!(group.wasted_by(SizeMode::Apparent), 200);
+        assert_eq!(group.size_by(SizeMode::Disk), 8192);
+        assert_eq!(group.wasted_by(SizeMode::Disk), 8192);
     }
 
     #[test]
@@ -554,6 +662,14 @@ mod tests {
         assert_eq!(sizes.len(), 1, "{sizes:?}");
         assert_eq!(sizes[0].0, 100);
         assert_eq!(sizes[0].1.len(), 2);
+        for c in &sizes[0].1 {
+            let name = c.path.file_name().unwrap().to_str().unwrap();
+            assert_eq!(
+                c.disk_size,
+                s.find(Path::new(name)).unwrap().disk_size,
+                "allocation lost for {name}"
+            );
+        }
 
         // Above the duplicate size everything is filtered out.
         let sizes = same_size_files(&s.tree, &s.root, &DupeOptions { min_size: 1000 });
@@ -584,7 +700,7 @@ mod tests {
                     size,
                     names
                         .into_iter()
-                        .map(|n| dir.path().join(n))
+                        .map(|n| cand(dir.path().join(n), size))
                         .collect::<Vec<_>>(),
                 )
             })
@@ -608,7 +724,7 @@ mod tests {
         va[35_000] = b'y';
         fs::write(&a, &va).unwrap();
         fs::write(&b, &vb).unwrap();
-        let groups = hash_candidates(vec![(30_000, vec![a, b])]);
+        let groups = hash_candidates(vec![(30_000, vec![cand(a, 30_000), cand(b, 30_000)])]);
         assert!(groups.is_empty(), "grouped on a stale size: {groups:?}");
     }
 
@@ -617,7 +733,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a");
         fs::write(&a, b"data").unwrap();
-        assert!(hash_candidates(vec![(4, vec![a])]).is_empty());
+        assert!(hash_candidates(vec![(4, vec![cand(a, 4)])]).is_empty());
         assert!(hash_candidates(Vec::new()).is_empty());
     }
 }

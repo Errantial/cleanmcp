@@ -4,7 +4,7 @@
 //! once and then drill down without rescanning. All tools are read-only unless
 //! the server is started with `--allow-delete`, which adds `move_to_trash`.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ use cleanmcp_core::drives::{self, Drive};
 use cleanmcp_core::dupes::{self, DuplicateGroup};
 use cleanmcp_core::query::{self, AgeStat, Entry, ExtensionStat, FileFilter, format_time};
 use cleanmcp_core::rules::{self, Candidate, RuleSet};
+use cleanmcp_core::tree::{is_within, path_key, same_path};
 use cleanmcp_core::{Node, Scan, ScanOptions, SizeMode};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{
@@ -41,6 +42,17 @@ const MAX_CACHED_SCANS: usize = 4;
 const SCANS_URI: &str = "cleanmcp://scans";
 /// Largest accepted pagination offset.
 const MAX_OFFSET: usize = 100_000;
+/// Longest path string accepted from a client. Above any real path: Windows
+/// allows 32767 UTF-16 units (up to ~96 KiB as UTF-8), Linux `PATH_MAX` is 4 KiB.
+const MAX_PATH_LEN: usize = 128 * 1024;
+/// Most paths one `move_to_trash` call may name. Each costs a parent lookup and
+/// an audit line, so an unbounded list is a (possibly very slow) denial of service.
+const MAX_TRASH_PATHS: usize = 256;
+/// Longest `reason` copied into the audit log, once per path.
+const MAX_REASON_LEN: usize = 4 * 1024;
+/// Most paths a session remembers as "shown". Past this, new paths are not
+/// remembered; deleting one is then refused, which is the safe way to fail.
+const MAX_SEEN_PATHS: usize = 100_000;
 
 /// Cancels a running scan when the request that started it is dropped (client
 /// disconnect, shutdown, or an aborted handler). `spawn_blocking` tasks are not
@@ -132,7 +144,9 @@ pub struct CleanMcp {
     exclude: Arc<Vec<String>>,
     roots: Arc<Vec<PathBuf>>,
     /// Paths this session has shown the agent; only these may be trashed.
-    seen: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Keyed by platform path identity (see [`path_key`]) so Windows case
+    /// variants match and membership is O(1).
+    seen: Arc<Mutex<HashMap<String, PathBuf>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -328,6 +342,68 @@ fn bounded_top(depth: usize, top: usize) -> usize {
 
 fn mib(v: Option<u64>, default: u64) -> u64 {
     v.unwrap_or(default).saturating_mul(1024 * 1024)
+}
+
+/// Reject requests that would make the server do an unbounded amount of work:
+/// every path costs a parent lookup, and `reason` is copied into the audit log
+/// once per path.
+fn check_trash_request(paths: &[String], reason: Option<&str>) -> Result<(), String> {
+    if paths.len() > MAX_TRASH_PATHS {
+        return Err(format!(
+            "too many paths ({}); move at most {MAX_TRASH_PATHS} per call",
+            paths.len()
+        ));
+    }
+    if let Some(p) = paths.iter().find(|p| p.len() > MAX_PATH_LEN) {
+        return Err(format!(
+            "path is too long ({} bytes, max {MAX_PATH_LEN})",
+            p.len()
+        ));
+    }
+    if let Some(r) = reason
+        && r.len() > MAX_REASON_LEN
+    {
+        return Err(format!(
+            "reason is too long ({} bytes, max {MAX_REASON_LEN})",
+            r.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Split accepted targets into the paths to delete and the paths already
+/// covered by one of them. Every kept parent is checked, not just the previous
+/// path: an unrelated sibling (e.g. `/a-b`) can sort between a folder and its
+/// child (`/a/b`), which would otherwise make the child a second delete target.
+fn prune_covered(mut accepted: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) {
+    accepted.sort();
+    accepted.dedup();
+    let mut top_level: Vec<PathBuf> = Vec::new();
+    let mut covered: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for target in accepted {
+        match top_level.iter().find(|parent| is_within(&target, parent)) {
+            Some(parent) => covered.push((target, parent.to_path_buf())),
+            None => top_level.push(target),
+        }
+    }
+    (top_level, covered)
+}
+
+/// The result for a path that was not deleted separately because its parent
+/// folder was in the same request. It is only a success if the parent moved.
+fn covered_result(child: PathBuf, parent: &Path, parent_ok: bool) -> Removal {
+    Removal {
+        path: child,
+        ok: parent_ok,
+        error: Some(if parent_ok {
+            format!("included in {}", parent.display())
+        } else {
+            format!(
+                "not deleted: {} could not be moved to the trash",
+                parent.display()
+            )
+        }),
+    }
 }
 
 // ---- tools -----------------------------------------------------------------
@@ -642,6 +718,7 @@ impl CleanMcp {
         if p.paths.is_empty() {
             return Err("no paths given".into());
         }
+        check_trash_request(&p.paths, p.reason.as_deref())?;
         let mut accepted = Vec::new();
         let mut results = Vec::new();
         for raw in &p.paths {
@@ -663,22 +740,10 @@ impl CleanMcp {
                 accepted.push(target);
             }
         }
-        // A path inside another accepted folder goes with it; do not count it twice.
-        accepted.sort();
-        accepted.dedup();
-        let mut top_level: Vec<PathBuf> = Vec::new();
-        for t in accepted {
-            if top_level.last().is_some_and(|last| t.starts_with(last)) {
-                results.push(Removal {
-                    path: t,
-                    ok: true,
-                    error: Some("included in a parent folder in this request".into()),
-                });
-            } else {
-                top_level.push(t);
-            }
-        }
-        let accepted = top_level;
+        // A path inside another accepted folder goes with it; do not count it
+        // twice. Every kept parent is checked, not just the previous path: an
+        // unrelated sibling can sort between a folder and its child.
+        let (accepted, covered) = prune_covered(accepted);
         // Sizes from the cache, before the nodes are removed.
         let sizes: Vec<u64> = accepted.iter().map(|p| self.cached_disk_size(p)).collect();
         let to_delete = accepted.clone();
@@ -696,6 +761,14 @@ impl CleanMcp {
                 gone.push(r.path.clone());
             }
             audit(r, size, p.reason.as_deref());
+        }
+        // A path covered by a parent is only deleted if that parent really moved.
+        for (child, parent) in covered {
+            let parent_ok = removed
+                .iter()
+                .find(|r| same_path(&r.path, &parent))
+                .is_some_and(|r| r.ok);
+            results.push(covered_result(child, &parent, parent_ok));
         }
         // Updating cached scans may wait on long readers; keep it off the async workers.
         let this = self.clone();
@@ -795,7 +868,7 @@ impl ServerHandler for CleanMcp {
 
 impl CleanMcp {
     fn check_root(&self, path: &Path) -> Result<(), String> {
-        if self.roots.is_empty() || self.roots.iter().any(|r| path.starts_with(r)) {
+        if self.roots.is_empty() || self.roots.iter().any(|r| is_within(path, r)) {
             Ok(())
         } else {
             Err(format!(
@@ -806,6 +879,12 @@ impl CleanMcp {
     }
 
     fn absolute(&self, path: &str) -> Result<PathBuf, String> {
+        if path.len() > MAX_PATH_LEN {
+            return Err(format!(
+                "path is too long ({} bytes, max {MAX_PATH_LEN})",
+                path.len()
+            ));
+        }
         let p = cleanmcp_core::resolve_path(Path::new(path))
             .map_err(|e| format!("bad path {path}: {e}"))?;
         self.check_root(&p)?;
@@ -814,7 +893,13 @@ impl CleanMcp {
 
     fn remember<'a>(&self, paths: impl Iterator<Item = &'a PathBuf>) {
         let mut seen = self.seen.lock().unwrap();
-        seen.extend(paths.cloned());
+        for path in paths {
+            let key = path_key(path);
+            if seen.len() >= MAX_SEEN_PATHS && !seen.contains_key(&key) {
+                continue;
+            }
+            seen.insert(key, path.clone());
+        }
     }
 
     /// Return a cached scan covering `path`, or scan it now.
@@ -849,7 +934,7 @@ impl CleanMcp {
                 .enumerate()
                 .filter(|(_, s)| {
                     let s = s.read().unwrap();
-                    abs.starts_with(&s.root)
+                    is_within(&abs, &s.root)
                         && (!require_settings || s.settings.one_filesystem == one_filesystem)
                 })
                 .max_by_key(|(_, s)| s.read().unwrap().root.as_os_str().len())
@@ -903,7 +988,7 @@ impl CleanMcp {
             let s = s.read().unwrap();
             // Keep a nested scan that started after this one did: it is a newer
             // view of that subtree even if it finished first.
-            !s.root.starts_with(&root) || s.started_at >= scan_started
+            !is_within(&s.root, &root) || s.started_at >= scan_started
         });
         if cache.len() >= MAX_CACHED_SCANS {
             cache.remove(0);
@@ -916,10 +1001,11 @@ impl CleanMcp {
     /// exact path handed to the trash crate (its parent may have been swapped).
     fn delete_allowed(&self, target: &Path) -> Result<(), String> {
         self.check_root(target)?;
-        if self.roots.iter().any(|r| r == target) {
+        if self.roots.iter().any(|r| same_path(r, target)) {
             return Err("refused: it is one of the server's --root folders".into());
         }
-        if !self.seen.lock().unwrap().contains(target) {
+        let key = path_key(target);
+        if !self.seen.lock().unwrap().contains_key(&key) {
             return Err(
                 "refused: not returned by a previous tool call in this session; find it \
                         with list_children, largest_files or find_cleanup_candidates first"
@@ -938,8 +1024,7 @@ impl CleanMcp {
             .filter_map(|s| {
                 let s = s.read().unwrap();
                 let node = s.find(path)?;
-                path.starts_with(&s.root)
-                    .then_some((s.root.as_os_str().len(), node.disk_size))
+                is_within(path, &s.root).then_some((s.root.as_os_str().len(), node.disk_size))
             })
             .max_by_key(|(root_len, _)| *root_len)
             .map_or(0, |(_, size)| size)
@@ -960,11 +1045,11 @@ impl CleanMcp {
         let scans: Vec<SharedScan> = self.cache.lock().unwrap().clone();
         for s in scans.iter() {
             let mut s = s.write().unwrap();
-            if path.starts_with(&s.root) {
+            if is_within(path, &s.root) {
                 s.remove(path);
             }
         }
-        self.seen.lock().unwrap().retain(|p| !p.starts_with(path));
+        self.seen.lock().unwrap().retain(|_, p| !is_within(p, path));
     }
 }
 
@@ -1075,5 +1160,121 @@ mod tests {
         // `..` tricks are resolved before the check.
         let sneaky = format!("{}/..", dir.path().display());
         assert!(s.absolute(&sneaky).is_err());
+        // An absurdly long string is refused before it reaches the filesystem.
+        let huge = "x".repeat(MAX_PATH_LEN + 1);
+        assert!(s.absolute(&huge).is_err());
+    }
+
+    fn delete_server(root: &Path) -> CleanMcp {
+        CleanMcp::new(
+            Config::default(),
+            &McpOptions {
+                roots: vec![root.to_path_buf()],
+                allow_delete: true,
+                http: None,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn trash_requests_are_bounded() {
+        let paths: Vec<String> = (0..=MAX_TRASH_PATHS)
+            .map(|i| format!("/tmp/f{i}"))
+            .collect();
+        let err = check_trash_request(&paths, None).unwrap_err();
+        assert!(err.contains("too many paths"), "{err}");
+
+        let long = "x".repeat(MAX_PATH_LEN + 1);
+        let err = check_trash_request(&[long], None).unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+
+        let reason = "r".repeat(MAX_REASON_LEN + 1);
+        let err = check_trash_request(&["/tmp/a".into()], Some(&reason)).unwrap_err();
+        assert!(err.contains("reason is too long"), "{err}");
+
+        assert!(check_trash_request(&["/tmp/a".into()], Some("old build output")).is_ok());
+    }
+
+    #[test]
+    fn nested_targets_are_pruned_and_reported_honestly() {
+        let accepted = ["/a", "/a-b", "/a/b", "/a/b/c"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let (top, covered) = prune_covered(accepted);
+        // `/a/b` sorts after `/a-b`, but is still inside `/a`.
+        assert_eq!(top, [PathBuf::from("/a"), PathBuf::from("/a-b")]);
+        assert_eq!(covered.len(), 2, "{covered:?}");
+
+        let parent = Path::new("/a");
+        assert!(covered_result(PathBuf::from("/a/b"), parent, true).ok);
+        let failed = covered_result(PathBuf::from("/a/b"), parent, false);
+        assert!(!failed.ok);
+        assert!(failed.error.unwrap().contains("not deleted"));
+    }
+
+    #[test]
+    fn seen_paths_are_bounded() {
+        let s = CleanMcp::new(Config::default(), &McpOptions::default()).unwrap();
+        let paths: Vec<PathBuf> = (0..MAX_SEEN_PATHS + 5)
+            .map(|i| PathBuf::from(format!("/p/{i}")))
+            .collect();
+        s.remember(paths.iter());
+        assert_eq!(s.seen.lock().unwrap().len(), MAX_SEEN_PATHS);
+        // Already remembered paths can still be refreshed after the cap is hit.
+        s.remember(paths.iter().take(1));
+        assert_eq!(s.seen.lock().unwrap().len(), MAX_SEEN_PATHS);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shown_paths_match_in_any_case() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Project")).unwrap();
+        let file = dir.path().join("Project").join("Report.TXT");
+        std::fs::write(&file, b"x").unwrap();
+        let root = cleanmcp_core::resolve_path(dir.path()).unwrap();
+        let canonical = cleanmcp_core::resolve_path(&file).unwrap();
+        let s = delete_server(&root);
+        s.remember(std::iter::once(&canonical));
+        // The same file, retyped in another case, is recognised as shown.
+        let variant = canonical.with_file_name("report.txt");
+        assert!(s.delete_allowed(&variant).is_ok());
+    }
+
+    /// The case-insensitive seen-set must not let a case variant of a `--root`
+    /// folder itself through the root guard.
+    #[cfg(windows)]
+    #[test]
+    fn root_folder_is_refused_even_with_a_different_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = cleanmcp_core::resolve_path(dir.path()).unwrap();
+        let s = delete_server(&root);
+        s.remember(std::iter::once(&root));
+        let name = root.file_name().unwrap().to_string_lossy().to_uppercase();
+        let variant = root.with_file_name(&name);
+        assert_eq!(
+            path_key(&root),
+            path_key(&variant),
+            "test needs a case variant"
+        );
+        let err = s.delete_allowed(&variant).unwrap_err();
+        assert!(err.contains("--root"), "{err}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn shown_paths_are_case_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Report.TXT");
+        std::fs::write(&file, b"x").unwrap();
+        let root = cleanmcp_core::resolve_path(dir.path()).unwrap();
+        let canonical = cleanmcp_core::resolve_path(&file).unwrap();
+        let s = delete_server(&root);
+        s.remember(std::iter::once(&canonical));
+        assert!(s.delete_allowed(&canonical).is_ok());
+        let variant = canonical.with_file_name("report.txt");
+        assert!(s.delete_allowed(&variant).is_err());
     }
 }

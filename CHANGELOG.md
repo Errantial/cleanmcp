@@ -1,14 +1,32 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-11-04
 
-Correctness and safety fixes from a second review pass. No new commands; the snapshot format and
-CLI flags are unchanged.
+Security hardening, more honest JSON, a layout for narrow terminals, and faster diffs. The one
+breaking change is the shape of `dupes --json`, called out under CLI; the snapshot format is
+unchanged.
+
+### Speed
+- `diff` loads snapshots up to **5x faster** by skipping rows below the requested depth (1.7x end
+  to end on a 288k-entry snapshot; output unchanged). A 288,135-entry / 13.4 MB snapshot loads in
+  20.5 ms instead of 106 ms at depth 1 and 25 ms instead of 132 ms at depth 3 (gzip: 64/67 ms,
+  was 155/217 ms), with allocations down from 62,375 to 16 and from 62,535 to 864. `cleanmcp
+  diff -d 3` on that snapshot is 167 ms instead of 290 ms plain and 308 ms instead of 406 ms
+  gzipped. Full loads still parse and validate every row.
 
 ### Safety
 - `move_to_trash` now re-applies `--root` and the "only paths this session was shown" rule to the
   exact path handed to the trash crate. The parent is resolved twice, so a folder swapped for a
   link between the check and the delete is refused instead of silently deleted.
+- Path identity on Windows is component-wise case-insensitive, matching the rest of the scan, so a
+  path retyped in another case cannot slip past the `--root` or seen-path checks. The same
+  identity is used for tree lookup, removal and the `--root` guard.
+- Refuses to trash the Recycle Bin and freedesktop Trash stores and their contents
+  (`C:\$Recycle.Bin`, any volume's `$Recycle.Bin`, `System Volume Information`,
+  `~/.local/share/Trash`, `/Trash`): they hold data that is already deleted or still recoverable.
+- Bounds what a client can make `move_to_trash` do: 256 paths per call, 128 KiB per path string,
+  4 KiB per reason, and 100k remembered paths. Nested targets are pruned against every accepted
+  parent, and a path is reported deleted only when its parent actually moved.
 - Other users' profiles are protected on relocated layouts (Windows `D:\Profiles\me`, Silverblue's
   `/var/home/me`), not only under the hardcoded `C:\Users` / `/home` roots.
 - The test that asserts home folders are protected no longer calls the real trash on your home
@@ -38,7 +56,29 @@ CLI flags are unchanged.
   `\\?\` prefixes are well formed.
 
 ### CLI
+- `dupes` now prices each copy and the wasted total in the selected size mode: the default reports
+  space used on disk (matching the rest of the tool) and `--apparent` reports logical lengths.
+  Grouping still uses the logical length, which identical content requires.
+- **Breaking:** `dupes --json` is now an object with `total_groups`, `total_wasted` and `groups`
+  instead of a bare array, so a truncated page no longer hides how many groups exist or what they
+  total. Every group also reports `disk_size` and `wasted_disk_size`; the MCP `find_duplicates`
+  groups gain those two fields (additive) and keep their logical totals.
+- `tree --json` nodes gained `children_truncated` (the depth limit or `top` left children out, so
+  an empty `children` list no longer looks like an empty folder) and `other_size` (the omitted
+  children in the selected size mode). Omitted-children totals now also cover folders below the
+  depth limit, not only the tail cut by `top`. `list_children` in the MCP server shares this shape,
+  so it gains both fields and reports the omitted children at its depth limit too.
 - An explicit `--config` path that does not exist now errors instead of silently using defaults.
+- An invalid `--exclude` glob now says the pattern is invalid instead of "cannot scan <path>",
+  which blamed the folder for a typo.
+- `diff <directory>` now says it needs a snapshot file instead of "cannot read <dir>: access is
+  denied".
+
+### Terminal UI
+- Below 60 columns the tree list switches to a filename-first row with one right-aligned
+  size/percent column, and the header elides the path from the left so the folder name survives.
+- Footer hints are chosen from what fits and always keep `? help` and `q quit`. The help popup has
+  a one-column layout that fits 40x10, and drops its cosmetic blank line before dropping hints.
 
 ### Build
 - `rust-version` is 1.88 (the code uses let-chains, stabilized there) and CI compiles that version.

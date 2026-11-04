@@ -178,9 +178,18 @@ pub struct TreeJson {
     pub file_count: u64,
     pub age_days: Option<u64>,
     pub errors: u32,
-    /// Children beyond the `top` limit are summed into `other_disk_size`.
+    /// Space used on disk by the children this node did not list: the ones
+    /// beyond `top`, or all of them when the depth limit stopped the walk.
     pub other_disk_size: u64,
+    /// The same omitted children, in the requested size mode.
+    pub other_size: u64,
+    /// Children this node did not list (beyond `top`, or all of them when the
+    /// depth limit stopped the walk).
     pub other_count: usize,
+    /// `true` when the folder has children that are not in `children` (depth
+    /// limit or `top`), so an empty `children` does not mean an empty folder.
+    /// Files and genuinely empty folders are never truncated.
+    pub children_truncated: bool,
     pub children: Vec<TreeJson>,
 }
 
@@ -199,8 +208,21 @@ impl TreeJson {
         offset: usize,
         mode: SizeMode,
     ) -> Self {
-        let (children, other_disk_size, other_count) = if depth == 0 {
-            (Vec::new(), 0, 0)
+        let (children, other_disk_size, other_size, other_count, children_truncated) = if depth == 0
+        {
+            if node.children().is_empty() {
+                (Vec::new(), 0, 0, 0, false)
+            } else {
+                // The depth limit stopped the walk here. The node's rolled-up
+                // totals are exactly its (unlisted) children's totals.
+                (
+                    Vec::new(),
+                    node.disk_size,
+                    node.size_by(mode),
+                    node.children().len(),
+                    true,
+                )
+            }
         } else {
             let sorted = node.sorted_children(mode);
             let start = offset.min(sorted.len());
@@ -210,7 +232,13 @@ impl TreeJson {
                 .map(|c| TreeJson::build(c, &path.join(c.name.as_str()), depth - 1, top, mode))
                 .collect();
             let rest = sorted.get(start + top..).unwrap_or_default();
-            (kids, rest.iter().map(|c| c.disk_size).sum(), rest.len())
+            (
+                kids,
+                rest.iter().map(|c| c.disk_size).sum(),
+                rest.iter().map(|c| c.size_by(mode)).sum(),
+                rest.len(),
+                !rest.is_empty(),
+            )
         };
         TreeJson {
             path: path.to_path_buf(),
@@ -221,7 +249,9 @@ impl TreeJson {
             age_days: node.age().map(|d| d.as_secs() / 86_400),
             errors: node.errors(),
             other_disk_size,
+            other_size,
             other_count,
+            children_truncated,
             children,
         }
     }
@@ -253,17 +283,60 @@ pub fn print_age(stats: &[AgeStat], mode: SizeMode) {
     }
 }
 
-pub fn print_dupes(groups: &[DuplicateGroup], total_groups: usize, total_wasted: u64) {
+/// JSON document for `dupes --json`: totals for every group found, plus the
+/// (possibly truncated) page in `groups`.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct DupesJson {
+    /// Duplicate groups found, before `--top` (and therefore possibly more than
+    /// `groups.len()`).
+    pub total_groups: usize,
+    /// Bytes freed by keeping one copy of every group, in the requested size
+    /// mode (disk by default, `--apparent` for file lengths).
+    pub total_wasted: u64,
+    pub groups: Vec<DuplicateGroup>,
+}
+
+impl DupesJson {
+    /// Sort by wasted bytes in `mode`, keep `top` groups, and keep the totals
+    /// of all groups found.
+    pub fn build(groups: Vec<DuplicateGroup>, top: usize, mode: SizeMode) -> Self {
+        let mut groups = groups;
+        let total_groups = groups.len();
+        let total_wasted: u64 = groups.iter().map(|g| g.wasted_by(mode)).sum();
+        groups.sort_unstable_by(|a, b| {
+            b.wasted_by(mode)
+                .cmp(&a.wasted_by(mode))
+                .then_with(|| a.paths.cmp(&b.paths))
+        });
+        groups.truncate(top);
+        DupesJson {
+            total_groups,
+            total_wasted,
+            groups,
+        }
+    }
+}
+
+pub fn print_dupes(
+    groups: &[DuplicateGroup],
+    total_groups: usize,
+    total_wasted: u64,
+    mode: SizeMode,
+) {
     if groups.is_empty() {
-        println!("No duplicate files found.");
+        if total_groups == 0 {
+            println!("No duplicate files found.");
+        } else {
+            println!("No duplicate groups shown ({total_groups} found; raise --top).");
+        }
         return;
     }
     for g in groups {
         println!(
             "{} wasted  ({} copies of {})",
-            human(g.wasted),
+            human(g.wasted_by(mode)),
             g.paths.len(),
-            human(g.size)
+            human(g.size_by(mode))
         );
         for p in &g.paths {
             println!("    {}", p.display());
@@ -541,6 +614,142 @@ mod tests {
             min_size: 0,
             mode: SizeMode::Disk,
         }
+    }
+
+    fn file_node(name: &str, size: u64, disk: u64) -> Node {
+        let mut n = Node::new(NodeKind::File, name.into(), size, disk, 0);
+        n.set_counts(1, 0, 0);
+        n
+    }
+
+    fn dir_node(name: &str, children: Vec<Node>) -> Node {
+        let size = children.iter().map(|c| c.size).sum();
+        let disk = children.iter().map(|c| c.disk_size).sum();
+        let files = children.iter().map(|c| c.file_count()).sum();
+        let dirs = children
+            .iter()
+            .map(|c| c.dir_count() + u32::from(c.is_dir()))
+            .sum();
+        let mut n = Node::new(NodeKind::Dir, name.into(), size, disk, 0);
+        n.set_children(children);
+        n.set_counts(files, dirs, 0);
+        n
+    }
+
+    #[test]
+    fn tree_json_marks_depth_truncation_and_prices_omitted_children() {
+        let root = dir_node(
+            "root",
+            vec![
+                dir_node("empty", vec![]),
+                dir_node("full", vec![file_node("f", 100, 1_000)]),
+            ],
+        );
+        let path = Path::new("root");
+        fn child<'a>(t: &'a TreeJson, name: &str) -> &'a TreeJson {
+            t.children
+                .iter()
+                .find(|c| c.path.ends_with(name))
+                .unwrap_or_else(|| panic!("no child {name}"))
+        }
+
+        let t = TreeJson::build(&root, path, 1, 10, SizeMode::Apparent);
+        assert!(!t.children_truncated, "all children are listed");
+        assert!(!child(&t, "empty").children_truncated);
+        assert_eq!(child(&t, "empty").other_count, 0);
+
+        // `full` is a folder below the depth limit: not expanded, not empty.
+        let full = child(&t, "full");
+        assert!(full.children_truncated);
+        assert!(full.children.is_empty());
+        assert_eq!(full.other_count, 1);
+        assert_eq!(full.other_size, 100, "apparent size of the omitted file");
+        assert_eq!(full.other_disk_size, 1_000);
+
+        let t = TreeJson::build(&root, path, 1, 10, SizeMode::Disk);
+        let full = child(&t, "full");
+        assert_eq!(full.other_size, 1_000, "disk size in the default mode");
+        assert_eq!(full.other_disk_size, 1_000);
+    }
+
+    #[test]
+    fn tree_json_marks_a_truncated_tail() {
+        let root = dir_node(
+            "root",
+            vec![
+                file_node("a", 300, 3_000),
+                file_node("b", 200, 2_000),
+                file_node("c", 100, 1_000),
+            ],
+        );
+        let t = TreeJson::build(&root, Path::new("root"), 2, 2, SizeMode::Apparent);
+        assert_eq!(t.children.len(), 2);
+        assert!(t.children_truncated);
+        assert_eq!(t.other_count, 1);
+        assert_eq!(t.other_size, 100);
+        assert_eq!(t.other_disk_size, 1_000);
+        // Files are leaves even when the depth limit stops at them.
+        assert!(t.children.iter().all(|c| !c.children_truncated));
+
+        // All children shown: no truncation, no omitted totals.
+        let t = TreeJson::build(&root, Path::new("root"), 2, 3, SizeMode::Apparent);
+        assert!(!t.children_truncated);
+        assert_eq!((t.other_count, t.other_size, t.other_disk_size), (0, 0, 0));
+    }
+
+    fn dupe_group(
+        name: &str,
+        size: u64,
+        copies: usize,
+        disk: u64,
+        wasted_disk: u64,
+    ) -> DuplicateGroup {
+        let paths = (0..copies)
+            .map(|i| PathBuf::from(format!("{name}{i}")))
+            .collect();
+        DuplicateGroup {
+            size,
+            disk_size: disk,
+            wasted: size * (copies as u64 - 1),
+            wasted_disk_size: wasted_disk,
+            hash: format!("hash-{name}"),
+            paths,
+        }
+    }
+
+    #[test]
+    fn dupes_json_reports_totals_and_prices_by_mode() {
+        // Same logical waste, very different on-disk waste: the default (disk)
+        // order must put the big allocation first.
+        let groups = vec![
+            dupe_group("small", 50, 3, 1_000, 2_000),
+            dupe_group("big", 100, 2, 10_000, 10_000),
+        ];
+        let d = DupesJson::build(groups.clone(), 1, SizeMode::Disk);
+        assert_eq!(d.total_groups, 2);
+        assert_eq!(d.total_wasted, 12_000);
+        assert_eq!(d.groups.len(), 1);
+        assert_eq!(d.groups[0].paths[0], PathBuf::from("big0"));
+
+        let d = DupesJson::build(groups, 10, SizeMode::Apparent);
+        assert_eq!(d.total_groups, 2);
+        assert_eq!(d.total_wasted, 200);
+        assert_eq!(d.groups.len(), 2);
+
+        let v = serde_json::to_value(DupesJson::build(
+            vec![self::dupe_group("g", 10, 2, 4096, 4096)],
+            10,
+            SizeMode::Apparent,
+        ))
+        .unwrap();
+        let obj = v.as_object().unwrap();
+        let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["groups", "total_groups", "total_wasted"]);
+        let group = &obj["groups"][0];
+        assert_eq!(group["size"], 10);
+        assert_eq!(group["disk_size"], 4096);
+        assert_eq!(group["wasted"], 10);
+        assert_eq!(group["wasted_disk_size"], 4096);
     }
 
     #[test]

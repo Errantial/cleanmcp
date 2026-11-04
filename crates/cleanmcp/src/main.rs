@@ -76,7 +76,16 @@ fn run_scan(path: &std::path::Path, opts: ScanOptions, quiet: bool) -> Result<Sc
     let reporter = (!quiet).then(|| progress::Reporter::start(opts.control.clone()));
     let result = cleanmcp_core::scan(path, &opts);
     drop(reporter);
-    let scan = result.with_context(|| format!("cannot scan {}", path.display()))?;
+    let scan = match result {
+        Ok(scan) => scan,
+        // The scan also builds the exclude matcher, so a bad glob comes back
+        // from here. "cannot scan <path>" would blame the folder for a typo in
+        // `--exclude`.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            bail!("invalid --exclude pattern: {e}")
+        }
+        Err(e) => return Err(e).with_context(|| format!("cannot scan {}", path.display())),
+    };
     output::print_scan_notes(&scan);
     if root_unreadable(&scan) {
         anyhow::bail!(
@@ -263,6 +272,19 @@ enum Command {
     },
 }
 
+/// `diff`'s first argument must be a snapshot file. Opening a directory as one
+/// says "access is denied" on Windows, which blames permissions for a command
+/// that simply needs a file.
+fn check_snapshot_file(path: &std::path::Path) -> Result<()> {
+    if path.is_dir() {
+        bail!(
+            "{} is a directory, not a snapshot file; run `cleanmcp snapshot` first",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Load the config, treating a missing *explicit* path as a typo rather than
 /// "use defaults" (the default location may legitimately not exist).
 fn load_config(path: Option<&std::path::Path>) -> Result<Config> {
@@ -401,15 +423,13 @@ fn main() -> Result<()> {
         } => {
             let cfg = config()?;
             let s = scan.run(&cfg)?;
-            let mut groups =
-                dupes::find_duplicates(&s.tree, &s.root, &dupes::DupeOptions { min_size });
-            let total_wasted: u64 = groups.iter().map(|g| g.wasted).sum();
-            let total_groups = groups.len();
-            groups.truncate(top);
+            let mode = scan.mode();
+            let groups = dupes::find_duplicates(&s.tree, &s.root, &dupes::DupeOptions { min_size });
+            let d = output::DupesJson::build(groups, top, mode);
             if json {
-                output::print_json(&groups)
+                output::print_json(&d)
             } else {
-                output::print_dupes(&groups, total_groups, total_wasted);
+                output::print_dupes(&d.groups, d.total_groups, d.total_wasted, mode);
                 Ok(())
             }
         }
@@ -489,6 +509,7 @@ fn main() -> Result<()> {
             json,
         } => {
             let cfg = config()?;
+            check_snapshot_file(&old)?;
             let header = snapshot::read_header(&old)
                 .with_context(|| format!("cannot read {}", old.display()))?;
             let mode = if apparent {
@@ -588,6 +609,31 @@ mod tests {
         // A file root is never "unreadable" in this sense.
         let f = Node::new(NodeKind::File, "f".into(), 1, 1, 0);
         assert!(!root_unreadable(&scan_with(f)));
+    }
+
+    #[test]
+    fn a_bad_exclude_glob_does_not_blame_the_scanned_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ScanOptions {
+            exclude: vec!["[".into()],
+            ..Default::default()
+        };
+        let err = run_scan(dir.path(), opts, true).unwrap_err().to_string();
+        assert!(err.contains("invalid --exclude pattern"), "{err}");
+        assert!(!err.contains("cannot scan"), "{err}");
+    }
+
+    #[test]
+    fn diff_rejects_a_directory_as_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = check_snapshot_file(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("is a directory, not a snapshot file"), "{err}");
+
+        let file = dir.path().join("snapshot.jsonl");
+        std::fs::write(&file, "").unwrap();
+        assert!(check_snapshot_file(&file).is_ok());
+        // A missing path is reported by the reader as "cannot read".
+        assert!(check_snapshot_file(&dir.path().join("gone")).is_ok());
     }
 
     #[test]
