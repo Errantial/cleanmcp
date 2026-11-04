@@ -50,14 +50,14 @@ The CLI and MCP server both call `cleanmcp-core`, so their answers always match.
 ## Roadmap
 
 ### Milestone 1: solid scanner
-- [ ] Allocated size on disk vs logical size (`GetCompressedFileSizeW` on Windows, `st_blocks` on Linux); add a `--apparent` flag
-- [ ] Hard-link de-duplication (inode / file ID) so totals are not inflated
-- [ ] `--one-filesystem` / skip other mounts (Linux `st_dev`; Windows volume serial)
-- [ ] Skip virtual filesystems on Linux by default (`/proc`, `/sys`, `/dev`, `/run`)
-- [ ] Exclude globs (`--exclude`), max depth during scan
-- [ ] Progress on stderr for long scans (entries/sec, current dir); cancel with Ctrl-C
-- [ ] Memory: move from `Vec<Node>` per dir to an arena (flat `Vec` + indices, interned names) and optionally drop file nodes below a size threshold. Target: under 100 B per entry, so a 5M-file drive fits in ~500 MB
-- [ ] Benchmarks against `dust`, `dua`, `gdu` on a large tree
+- [x] Allocated size on disk vs logical size (cluster rounding + `GetCompressedFileSizeW` for compressed/sparse files on Windows, `st_blocks` on Linux); `--apparent` flag. Cloud placeholders (OneDrive online-only) count as 0 on disk
+- [x] Hard-link de-duplication: always on Linux (free from `stat`); opt-in `--dedupe-hardlinks` on Windows (needs to open each file)
+- [x] `--one-filesystem` (Linux `st_dev`; Windows never crosses mount points because they are reparse points)
+- [x] Skip virtual filesystems on Linux by default (`/proc`, `/sys`, `/dev`, `/run`); `--include-virtual` to override
+- [x] Exclude globs (`--exclude`). *Dropped "max depth during scan": it would make directory totals wrong; use `tree -d` to limit display depth instead.*
+- [x] Progress line on stderr (entries, bytes, entries/s); `ScanControl` gives counters + cancel to library users (MCP). Ctrl-C in the CLI simply exits
+- [x] Memory: compact 80-byte `Node` with inline `CompactString` names instead of an arena: measured 101 B/entry peak on 8.6M entries (was 122). An arena is left for the optimization pass if needed
+- [x] Benchmarks recorded in `docs/benchmarks.md` (comparison with `dua`/`dust`/`gdu` deferred to the optimization pass)
 
 ### Milestone 2: TreeSize features
 - [ ] `cleanmcp drives`: list volumes with total/free space (Windows `GetDiskFreeSpaceExW`, Linux `statvfs` + `/proc/mounts`)

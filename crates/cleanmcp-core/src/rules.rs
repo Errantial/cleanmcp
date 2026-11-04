@@ -74,16 +74,16 @@ pub struct Candidate {
 pub fn find_candidates(root: &Node, base: &Path, min_size: u64) -> Vec<Candidate> {
     let mut out = Vec::new();
     visit(root, base, min_size, &mut out);
-    out.sort_unstable_by_key(|x| std::cmp::Reverse(x.entry.size));
+    out.sort_unstable_by_key(|x| std::cmp::Reverse(x.entry.disk_size));
     out
 }
 
 fn visit(node: &Node, path: &Path, min_size: u64, out: &mut Vec<Candidate>) {
     for child in node.children.iter().filter(|c| c.is_dir()) {
-        if child.size < min_size {
+        if child.disk_size < min_size {
             continue;
         }
-        let child_path = path.join(&child.name);
+        let child_path = path.join(&*child.name);
         let matched = RULES.iter().find(|r| {
             child.name.eq_ignore_ascii_case(r.dir_name)
                 && r.requires_sibling

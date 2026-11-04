@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::Result;
 use cleanmcp_core::query::{self, Entry, ExtensionStat};
 use cleanmcp_core::rules::{self, Candidate};
-use cleanmcp_core::{Node, Scan, ScanOptions};
+use cleanmcp_core::{Node, Scan, ScanOptions, SizeMode};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{Json, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
@@ -78,8 +78,11 @@ pub struct SuggestParams {
 #[derive(Serialize, JsonSchema)]
 pub struct ScanSummary {
     pub root: PathBuf,
+    /// Allocated size on disk in bytes (what deleting frees).
+    pub disk_size: u64,
+    /// Logical (apparent) size in bytes.
     pub size: u64,
-    pub size_human: String,
+    pub disk_size_human: String,
     pub file_count: u64,
     pub dir_count: u64,
     /// Entries that could not be read (usually permission denied).
@@ -100,8 +103,9 @@ pub struct ExtResult {
 
 #[derive(Serialize, JsonSchema)]
 pub struct SuggestResult {
-    pub total_size: u64,
-    pub total_size_human: String,
+    /// Sum of the candidates' on-disk sizes.
+    pub total_disk_size: u64,
+    pub total_disk_size_human: String,
     pub candidates: Vec<Candidate>,
     pub note: &'static str,
 }
@@ -132,16 +136,17 @@ impl CleanMcp {
             .children
             .iter()
             .take(15)
-            .map(|c| Entry::from_node(&scan.root.join(&c.name), c))
+            .map(|c| Entry::from_node(&scan.root.join(&*c.name), c))
             .collect();
         Ok(Json(ScanSummary {
             root: scan.root.clone(),
+            disk_size: t.disk_size,
             size: t.size,
-            size_human: crate::output::human(t.size),
-            file_count: t.file_count,
-            dir_count: t.dir_count,
-            errors: t.errors,
-            elapsed_ms: scan.elapsed_ms as u64,
+            disk_size_human: crate::output::human(t.disk_size),
+            file_count: t.file_count as u64,
+            dir_count: t.dir_count as u64,
+            errors: t.errors as u64,
+            elapsed_ms: scan.elapsed_ms,
             top_children,
         }))
     }
@@ -162,6 +167,7 @@ impl CleanMcp {
             &path,
             p.depth.unwrap_or(1),
             p.top.unwrap_or(20),
+            SizeMode::Disk,
         )))
     }
 
@@ -177,7 +183,7 @@ impl CleanMcp {
         let node = find(&scan, &path)?;
         let min_age = p.older_than_days.map(|d| Duration::from_secs(d * 86_400));
         Ok(Json(FilesResult {
-            files: query::largest_files(node, &path, p.top.unwrap_or(25), min_age),
+            files: query::largest_files(node, &path, p.top.unwrap_or(25), min_age, SizeMode::Disk),
         }))
     }
 
@@ -192,7 +198,7 @@ impl CleanMcp {
         let (path, scan) = self.resolve(&p.path).await?;
         let node = find(&scan, &path)?;
         Ok(Json(ExtResult {
-            extensions: query::by_extension(node, p.top.unwrap_or(25)),
+            extensions: query::by_extension(node, p.top.unwrap_or(25), SizeMode::Disk),
         }))
     }
 
@@ -209,10 +215,10 @@ impl CleanMcp {
         let (path, scan) = self.resolve(&p.path).await?;
         let node = find(&scan, &path)?;
         let candidates = rules::find_candidates(node, &path, p.min_mib.unwrap_or(10) * 1024 * 1024);
-        let total_size = candidates.iter().map(|c| c.entry.size).sum();
+        let total_disk_size = candidates.iter().map(|c| c.entry.disk_size).sum();
         Ok(Json(SuggestResult {
-            total_size,
-            total_size_human: crate::output::human(total_size),
+            total_disk_size,
+            total_disk_size_human: crate::output::human(total_disk_size),
             candidates,
             note: "Suggestions only. 'regenerable' items are rebuilt by tools; 'review' items may hold user data.",
         }))
@@ -267,7 +273,7 @@ impl CleanMcp {
 }
 
 fn absolute(path: &str) -> Result<PathBuf, String> {
-    std::path::absolute(path).map_err(|e| format!("bad path {path}: {e}"))
+    cleanmcp_core::resolve_path(Path::new(path)).map_err(|e| format!("bad path {path}: {e}"))
 }
 
 fn find<'a>(scan: &'a Scan, path: &Path) -> Result<&'a Node, String> {
