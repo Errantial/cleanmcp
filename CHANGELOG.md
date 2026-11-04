@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+Correctness and safety fixes from a second review pass. No new commands; the snapshot format and
+CLI flags are unchanged.
+
+### Safety
+- `move_to_trash` now re-applies `--root` and the "only paths this session was shown" rule to the
+  exact path handed to the trash crate. The parent is resolved twice, so a folder swapped for a
+  link between the check and the delete is refused instead of silently deleted.
+- Other users' profiles are protected on relocated layouts (Windows `D:\Profiles\me`, Silverblue's
+  `/var/home/me`), not only under the hardcoded `C:\Users` / `/home` roots.
+- The test that asserts home folders are protected no longer calls the real trash on your home
+  directory; a regression now fails an assertion instead of binning it.
+
+### MCP server
+- A client cancel, dropped request, or server shutdown now stops the scan behind every tool, not
+  only `scan_directory`; a `spawn_blocking` scan that nobody is waiting for is cancelled.
+- `freed_disk_size` and the deletion audit log take the size from the most specific cached scan,
+  not the least recently used one (a refreshed subtree could report the parent's stale size).
+- A parent scan that started earlier no longer evicts a newer subtree scan when it finishes later.
+
+### Snapshots
+- Loading a snapshot rolls up per-node error counts again: a file that could not be read was
+  invisible to its ancestors' totals (released snapshots carry own-errors, so this affects them).
+- A snapshot truncated between rows, or with a folder whose size no longer matches its children,
+  now fails to load instead of producing a plausible partial tree that `diff` reports as fiction.
+- Rejects a file containing two roots (concatenated snapshots) and children under a file row.
+- `save` fsyncs before the rename, so a crash cannot leave an empty snapshot where a good one was.
+- A scan root that is not valid UTF-8 is stored lossily instead of failing the save on Linux.
+
+### Windows
+- Small files on network drives are no longer reported as 0 bytes on disk (NTFS "resident file"
+  accounting is only applied to local volumes).
+- Fixed the `\\?\UNC\` prefix built for UNC paths, which was missing its separator.
+- Added tests that a junction is classified as a link and is never descended, and that the
+  `\\?\` prefixes are well formed.
+
+### CLI
+- An explicit `--config` path that does not exist now errors instead of silently using defaults.
+
+### Build
+- `rust-version` is 1.88 (the code uses let-chains, stabilized there) and CI compiles that version.
+
 ## 0.2.0 - 2026-11-04
 
 Performance pass, plus correctness fixes found by reviewing the optimized code. No breaking
