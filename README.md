@@ -43,8 +43,8 @@ cleanmcp tree . --json                 # most commands support --json
 ```
 
 Sizes are space used on disk by default (`--apparent` for file lengths). Hard links are counted once
-(`--dedupe-hardlinks` on Windows), symlinks/junctions are never followed, and OneDrive online-only
-files count as 0 bytes on disk.
+(`--dedupe-hardlinks` on Windows), symlinks/junctions inside the tree are never followed (the path
+you pass is resolved first), and OneDrive online-only files count as 0 bytes on disk.
 
 ### Custom cleanup rules
 
@@ -62,8 +62,9 @@ safety = "review"              # or "regenerable"
 reason = "Rendered video output"
 ```
 
-Only `cleanmcp ui` can delete, and only by moving items to the Recycle Bin / Trash after you confirm.
-System folders, drive roots and your home folder are always refused. `suggest` lists folders with a reason and a safety level:
+`cleanmcp ui` deletes after you confirm, and `cleanmcp mcp --allow-delete` lets an agent do the
+same for paths it was shown. Either way the item goes to the Recycle Bin / Trash, never removed
+permanently. System folders, drive roots and your home folder are always refused. `suggest` lists folders with a reason and a safety level:
 `regenerable` (build output, caches) or `review` (may hold data you want).
 
 ## MCP server

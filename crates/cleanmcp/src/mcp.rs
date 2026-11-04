@@ -42,6 +42,17 @@ const SCANS_URI: &str = "cleanmcp://scans";
 /// Largest accepted pagination offset.
 const MAX_OFFSET: usize = 100_000;
 
+/// Cancels a running scan when the request that started it is dropped (client
+/// disconnect, shutdown, or an aborted handler). `spawn_blocking` tasks are not
+/// cancelled by dropping their handle, so the walker needs this signal.
+struct CancelOnDrop(Arc<cleanmcp_core::scan::ScanControl>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// How the server was started.
 #[derive(Debug, Clone, Default)]
 pub struct McpOptions {
@@ -415,8 +426,9 @@ impl CleanMcp {
     async fn list_children(
         &self,
         Parameters(p): Parameters<ChildrenParams>,
+        ct: CancellationToken,
     ) -> Result<Json<TreeJson>, String> {
-        let (path, scan) = self.resolve(&p.path).await?;
+        let (path, scan) = self.resolve(&p.path, ct).await?;
         let depth = p.depth.unwrap_or(1).clamp(1, 4);
         let top = bounded_top(depth, p.top.unwrap_or(20).min(200));
         let offset = p.offset.unwrap_or(0);
@@ -454,8 +466,9 @@ impl CleanMcp {
     async fn largest_files(
         &self,
         Parameters(p): Parameters<FilesParams>,
+        ct: CancellationToken,
     ) -> Result<Json<FilesResult>, String> {
-        let (path, scan) = self.resolve(&p.path).await?;
+        let (path, scan) = self.resolve(&p.path, ct).await?;
         let top = p.top.unwrap_or(25).min(500);
         let offset = p.offset.unwrap_or(0).min(MAX_OFFSET);
         let filter = FileFilter {
@@ -491,8 +504,9 @@ impl CleanMcp {
     async fn extension_breakdown(
         &self,
         Parameters(p): Parameters<TopParams>,
+        ct: CancellationToken,
     ) -> Result<Json<ExtResult>, String> {
-        let (path, scan) = self.resolve(&p.path).await?;
+        let (path, scan) = self.resolve(&p.path, ct).await?;
         let top = p.top.unwrap_or(25).min(500);
         let extensions = tokio::task::spawn_blocking(move || {
             let s = scan.read().unwrap();
@@ -512,8 +526,9 @@ impl CleanMcp {
     async fn age_breakdown(
         &self,
         Parameters(p): Parameters<PathParams>,
+        ct: CancellationToken,
     ) -> Result<Json<AgeResult>, String> {
-        let (path, scan) = self.resolve(&p.path).await?;
+        let (path, scan) = self.resolve(&p.path, ct).await?;
         let buckets = tokio::task::spawn_blocking(move || {
             let s = scan.read().unwrap();
             let node = find(&s, &path)?;
@@ -534,8 +549,9 @@ impl CleanMcp {
     async fn find_cleanup_candidates(
         &self,
         Parameters(p): Parameters<SuggestParams>,
+        ct: CancellationToken,
     ) -> Result<Json<SuggestResult>, String> {
-        let (path, scan) = self.resolve(&p.path).await?;
+        let (path, scan) = self.resolve(&p.path, ct).await?;
         let rules = self.rules.clone();
         let min_size = mib(p.min_size_mib, 10);
         let all = tokio::task::spawn_blocking(move || {
@@ -578,8 +594,9 @@ impl CleanMcp {
     async fn find_duplicates(
         &self,
         Parameters(p): Parameters<DupesParams>,
+        ct: CancellationToken,
     ) -> Result<Json<DupesResult>, String> {
-        let (path, scan) = self.resolve(&p.path).await?;
+        let (path, scan) = self.resolve(&p.path, ct).await?;
         let min_size = mib(p.min_size_mib, 1).max(1);
         let top = p.top.unwrap_or(20).min(200);
         let offset = p.offset.unwrap_or(0).min(MAX_OFFSET);
@@ -640,18 +657,8 @@ impl CleanMcp {
                     continue;
                 }
             };
-            if let Err(e) = self.check_root(&target) {
+            if let Err(e) = self.delete_allowed(&target) {
                 results.push(refuse(e));
-            } else if self.roots.contains(&target) {
-                results.push(refuse(
-                    "refused: it is one of the server's --root folders".into(),
-                ));
-            } else if !self.seen.lock().unwrap().contains(&target) {
-                results.push(refuse(
-                    "refused: not returned by a previous tool call in this session; find it with \
-                     list_children, largest_files or find_cleanup_candidates first"
-                        .into(),
-                ));
             } else {
                 accepted.push(target);
             }
@@ -675,9 +682,12 @@ impl CleanMcp {
         // Sizes from the cache, before the nodes are removed.
         let sizes: Vec<u64> = accepted.iter().map(|p| self.cached_disk_size(p)).collect();
         let to_delete = accepted.clone();
-        let removed = tokio::task::spawn_blocking(move || remove::move_to_trash(&to_delete))
-            .await
-            .map_err(|e| e.to_string())?;
+        let this = self.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            remove::move_to_trash_checked(&to_delete, &|p| this.delete_allowed(p))
+        })
+        .await
+        .map_err(|e| e.to_string())?;
         let mut freed = 0;
         let mut gone = Vec::new();
         for (r, size) in removed.iter().zip(sizes) {
@@ -808,11 +818,13 @@ impl CleanMcp {
     }
 
     /// Return a cached scan covering `path`, or scan it now.
-    async fn resolve(&self, path: &str) -> Result<(PathBuf, SharedScan), String> {
+    async fn resolve(
+        &self,
+        path: &str,
+        ct: CancellationToken,
+    ) -> Result<(PathBuf, SharedScan), String> {
         let abs = self.absolute(path)?;
-        let scan = self
-            .get_scan(path, false, false, false, None, CancellationToken::new())
-            .await?;
+        let scan = self.get_scan(path, false, false, false, None, ct).await?;
         Ok((abs, scan))
     }
 
@@ -855,6 +867,8 @@ impl CleanMcp {
             ..Default::default()
         };
         let control = opts.control.clone();
+        // If this request is dropped before the scan finishes, stop the walker.
+        let _cancel_on_drop = CancelOnDrop(control.clone());
         let target = abs.clone();
         let mut job = tokio::task::spawn_blocking(move || cleanmcp_core::scan(&target, &opts));
         let mut tick = tokio::time::interval(Duration::from_millis(500));
@@ -880,10 +894,17 @@ impl CleanMcp {
             return Err("scan cancelled".into());
         }
         let root = scan.root.clone();
+        let scan_started = scan.started_at;
         let scan = Arc::new(RwLock::new(scan));
         let mut cache = self.cache.lock().unwrap();
-        // Drop scans this one replaces (same root or nested inside it), and the oldest if full.
-        cache.retain(|s| !s.read().unwrap().root.starts_with(&root));
+        // Drop scans this one replaces (same root, or a nested scan that started
+        // before this one), and the oldest if full.
+        cache.retain(|s| {
+            let s = s.read().unwrap();
+            // Keep a nested scan that started after this one did: it is a newer
+            // view of that subtree even if it finished first.
+            !s.root.starts_with(&root) || s.started_at >= scan_started
+        });
         if cache.len() >= MAX_CACHED_SCANS {
             cache.remove(0);
         }
@@ -891,12 +912,37 @@ impl CleanMcp {
         Ok(scan)
     }
 
+    /// The allow-list checks, applied when a request arrives and again to the
+    /// exact path handed to the trash crate (its parent may have been swapped).
+    fn delete_allowed(&self, target: &Path) -> Result<(), String> {
+        self.check_root(target)?;
+        if self.roots.iter().any(|r| r == target) {
+            return Err("refused: it is one of the server's --root folders".into());
+        }
+        if !self.seen.lock().unwrap().contains(target) {
+            return Err(
+                "refused: not returned by a previous tool call in this session; find it \
+                        with list_children, largest_files or find_cleanup_candidates first"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Disk size of `path` from the most specific scan that contains it.
     fn cached_disk_size(&self, path: &Path) -> u64 {
-        let cache = self.cache.lock().unwrap();
-        cache
+        // Clone the list first: a scan lock must never be taken under the cache lock.
+        let scans: Vec<SharedScan> = self.cache.lock().unwrap().clone();
+        scans
             .iter()
-            .find_map(|s| s.read().unwrap().find(path).map(|n| n.disk_size))
-            .unwrap_or(0)
+            .filter_map(|s| {
+                let s = s.read().unwrap();
+                let node = s.find(path)?;
+                path.starts_with(&s.root)
+                    .then_some((s.root.as_os_str().len(), node.disk_size))
+            })
+            .max_by_key(|(root_len, _)| *root_len)
+            .map_or(0, |(_, size)| size)
     }
 
     /// Same scan cache and settings, fresh "seen paths" list (one per HTTP session).
@@ -982,7 +1028,7 @@ mod tests {
     fn fan_out_is_bounded_by_depth() {
         // One level keeps the caller's top...
         assert_eq!(bounded_top(1, 200), 200);
-        // ...deeper levels are lowered so depth Ã— top stays within the budget.
+        // ...deeper levels are lowered so depth ÃƒÆ’Ã¢â‚¬â€ top stays within the budget.
         assert_eq!(bounded_top(2, 200), 141);
         assert_eq!(bounded_top(3, 200), 27);
         assert_eq!(bounded_top(4, 200), 11);

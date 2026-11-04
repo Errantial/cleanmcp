@@ -8,7 +8,7 @@ talks over stdio and every tool is **read-only**.
 | Flag | Effect |
 |---|---|
 | `--root DIR` | Only allow paths inside `DIR` (repeatable). Recommended when you enable deletion. |
-| `--allow-delete` | Adds the `move_to_trash` tool. Items go to the Recycle Bin / Trash (recoverable). It only accepts paths an earlier tool returned in the same session, and always refuses drive roots, your home folder, system folders and other users' profiles. Every attempt is logged to `%LOCALAPPDATA%\cleanmcp\deletions.log` / `~/.local/share/cleanmcp/deletions.log`. |
+| `--allow-delete` | Adds the `move_to_trash` tool. Items go to the Recycle Bin / Trash (recoverable). It only accepts paths an earlier tool returned in the same session, and always refuses drive roots, your home folder, system folders and other users' profiles. Attempts that reach the trash step are logged to `%LOCALAPPDATA%\cleanmcp\deletions.log` / `~/.local/share/cleanmcp/deletions.log`. |
 | `--http ADDR` | Serve Streamable HTTP at `http://ADDR/mcp` instead of stdio, e.g. `--http 127.0.0.1:8765`. There is no authentication: keep it on localhost. |
 | `--config FILE` | Use a specific config file (custom cleanup rules, excludes). |
 
@@ -78,7 +78,7 @@ Point any client that supports Streamable HTTP at `http://127.0.0.1:8765/mcp`.
 | `extension_breakdown` | Usage per file type |
 | `age_breakdown` | Usage by last-modified age |
 | `find_cleanup_candidates` | Folders that are usually safe to remove, with safety level, reason and cleanup command; paginated |
-| `find_duplicates` | Identical files, most wasted space first |
+| `find_duplicates` | Identical files, most wasted space first; `min_size_mib`, `top`, `offset`; paginated |
 | `move_to_trash` | Only with `--allow-delete`; see above |
 
 Resource: `cleanmcp://scans` lists the scans cached in the current session.

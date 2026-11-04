@@ -119,11 +119,25 @@ fn protection_reason_for(path: &Path, home: Option<&Path>) -> Option<&'static st
     if path.parent().is_none() || !p.contains('/') || p.ends_with(':') {
         return Some("it is a drive or filesystem root");
     }
+    // Profiles are not always under a fixed root: Windows supports relocated
+    // profiles (D:\Profiles\me) and Silverblue uses /var/home/me. The parent of
+    // the real home is the profile root in those layouts, as long as it is not
+    // itself a filesystem root.
+    let profile_parent = home
+        .and_then(Path::parent)
+        .filter(|parent| parent.parent().is_some())
+        .map(norm);
     let home = home.map(norm);
     if let Some(h) = &home
         && is_same_or_inside(h, &p)
     {
         return Some("it is your home folder or contains it");
+    }
+    if let Some(parent) = &profile_parent
+        && is_same_or_inside(&p, parent)
+        && !home.as_deref().is_some_and(|h| is_same_or_inside(&p, h))
+    {
+        return Some("it belongs to another user profile");
     }
     if system_dirs()
         .iter()
@@ -170,6 +184,13 @@ mod tests {
         assert!(r(r"C:\Users\other\AppData").is_some());
         assert!(r(r"C:\Users\me\AppData\Local\Temp").is_none());
         assert!(r(r"D:\games\old").is_none());
+
+        // Relocated profiles: the parent of the real home is a profile root too.
+        let relocated = Path::new(r"D:\Profiles\me");
+        let r = |p: &str| protection_reason_for(Path::new(p), Some(relocated));
+        assert!(r(r"D:\Profiles\other\Documents").is_some());
+        assert!(r(r"D:\Profiles\me\AppData\Local\Temp").is_none());
+        assert!(r(r"D:\games\old").is_none());
     }
 
     #[cfg(not(windows))]
@@ -187,5 +208,11 @@ mod tests {
         assert!(r("/home/me/.cache/pip").is_none());
         // A similar prefix is not "inside".
         assert!(r("/usrdata/x").is_none());
+
+        // Relocated profiles (Silverblue-style /var/home) are protected too.
+        let relocated = Path::new("/var/home/me");
+        let r = |p: &str| protection_reason_for(Path::new(p), Some(relocated));
+        assert!(r("/var/home/other/x").is_some());
+        assert!(r("/var/home/me/.cache/x").is_none());
     }
 }

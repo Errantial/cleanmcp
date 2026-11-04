@@ -180,10 +180,11 @@ mod imp {
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_FULL_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
         FILE_SHARE_READ, FILE_SHARE_WRITE, FileFullDirectoryInfo, FileFullDirectoryRestartInfo,
-        GetCompressedFileSizeW, GetDiskFreeSpaceW, GetFileInformationByHandle,
+        GetCompressedFileSizeW, GetDiskFreeSpaceW, GetDriveTypeW, GetFileInformationByHandle,
         GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
     };
 
+    const DRIVE_REMOTE: u32 = 4;
     const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
     const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
     const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
@@ -209,7 +210,7 @@ mod imp {
 
     /// UTF-16 form of `path` without a terminator. Absolute paths get the `\\?\`
     /// prefix, which also removes the MAX_PATH limit.
-    fn wide(path: &Path) -> Vec<u16> {
+    pub(crate) fn wide(path: &Path) -> Vec<u16> {
         let s = path.as_os_str();
         let bytes = s.as_encoded_bytes();
         let mut v: Vec<u16> = Vec::with_capacity(bytes.len() + 16);
@@ -218,6 +219,7 @@ mod imp {
             if bytes.starts_with(br"\\") {
                 // UNC: \\server\share -> \\?\UNC\server\share
                 v.extend(r"\\?\UNC".encode_utf16());
+                v.push(b'\\' as u16);
                 v.extend(s.encode_wide().skip(2));
             } else {
                 v.extend(r"\\?\".encode_utf16());
@@ -622,7 +624,11 @@ mod imp {
                     .iter()
                     .position(|&c| c == 0)
                     .unwrap_or(fs_name.len());
-                if String::from_utf16_lossy(&fs_name[..len]) == "NTFS" {
+                // A share reports the server's filesystem name, but residency is a
+                // local-MFT fact: a remote file is never in our MFT, and the space it
+                // occupies is not local disk space either.
+                let remote = GetDriveTypeW(vol.as_ptr()) == DRIVE_REMOTE;
+                if !remote && String::from_utf16_lossy(&fs_name[..len]) == "NTFS" {
                     info.resident_limit = NTFS_RESIDENT_LIMIT;
                 }
             }
@@ -701,5 +707,50 @@ mod windows_tests {
         let mut count = 0;
         assert_eq!(walk_dir(dir.path(), &mut |_| count += 1).unwrap(), 0);
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn wide_prefixes_are_well_formed() {
+        let w = |p: &str| String::from_utf16(&imp::wide(std::path::Path::new(p))).unwrap();
+        assert_eq!(w(r"C:\x"), r"\\?\C:\x");
+        // UNC keeps the separator before the server name.
+        assert_eq!(w(r"\\server\share\dir"), r"\\?\UNC\server\share\dir");
+        // Already-verbatim paths are left alone.
+        assert_eq!(w(r"\\?\C:\x"), r"\\?\C:\x");
+    }
+
+    /// Junctions must be links: `scan_dir` never descends into a `Link`, which is
+    /// what keeps a profile containing `Application Data -> AppData\Roaming`
+    /// from looping. `mklink /J` needs no elevation.
+    #[test]
+    fn junction_is_a_link_and_is_not_descended() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("loop");
+        let ok = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(dir.path())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skipping: this filesystem does not support junctions");
+            return;
+        }
+        let mut kind = None;
+        walk_dir(dir.path(), &mut |e| {
+            if e.name == "loop" {
+                kind = Some(e.kind);
+            }
+        })
+        .unwrap();
+        assert_eq!(kind, Some(NodeKind::Link));
+
+        let s = crate::scan(dir.path(), &crate::ScanOptions::default()).unwrap();
+        assert_eq!(
+            s.find(std::path::Path::new("loop")).unwrap().kind(),
+            NodeKind::Link
+        );
+        assert_eq!(s.tree.dir_count(), 0, "junction was descended into");
     }
 }
