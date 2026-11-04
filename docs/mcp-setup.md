@@ -85,7 +85,7 @@ Point any client that supports Streamable HTTP at `http://127.0.0.1:8765/mcp`.
 
 | Tool | What it does |
 |---|---|
-| `list_drives` | Volumes with total / used / free space (not limited by `--root`) |
+| `list_drives` | Volumes with total / used / free space (not limited by `--root`); `include_virtual` also lists pseudo filesystems |
 | `scan_directory` | Scan a folder or drive (cached), returning totals plus the largest 15 direct children and counts for the rest; `refresh`, `one_filesystem`, `apparent`; reports progress when the client supplies a progress token, and can be cancelled |
 | `list_children` | Drill into a folder, largest first; `depth` 1-4, `top` (default 20, max 200; lowered when `depth > 1`), `offset` for the first level, `apparent`; `other_count` / `other_disk_size` report what is left |
 | `largest_files` | Biggest files with `min_size_mib`, `older_than_days`, `newer_than_days`, `extensions`, `apparent`; `top` (default 25, max 500); `next_offset` for pagination |

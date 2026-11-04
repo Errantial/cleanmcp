@@ -7,8 +7,11 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::tree::{NO_TIME, Node, NodeKind, SizeMode};
@@ -213,14 +216,14 @@ pub(crate) fn lower_into<'b>(s: &str, buf: &'b mut [u8; NAME_BUF]) -> Option<&'b
 }
 
 /// Visit every file node, without building paths.
-fn visit_files(node: &Node, f: &mut impl FnMut(&Node)) {
+/// Parallel file walk: `f` may run on several threads at
+/// once, so it must be `Sync` and accumulate through atomics or a lock.
+fn visit_files_par(node: &Node, f: &(impl Fn(&Node) + Sync)) {
     if node.kind() == NodeKind::File {
         f(node);
         return;
     }
-    for c in node.children().iter() {
-        visit_files(c, f);
-    }
+    node.children().par_iter().for_each(|c| visit_files_par(c, f));
 }
 
 /// The `n` largest files anywhere below `base` that pass `filter`.
@@ -326,36 +329,39 @@ impl ExtensionStat {
 
 /// Total size per file extension, largest first.
 pub fn by_extension(root: &Node, n: usize, mode: SizeMode) -> Vec<ExtensionStat> {
-    let mut stats: Vec<ExtensionStat> = Vec::new();
-    // Extension -> index into `stats`. Looked up with a borrowed &str so the
-    // common case (an extension we have already seen) allocates nothing.
-    let mut index: HashMap<String, usize> = HashMap::new();
-    let mut add = |buf_key: &str, node: &Node| match index.get(buf_key) {
-        Some(&i) => {
-            let s = &mut stats[i];
-            s.disk_size += node.disk_size;
-            s.size += node.size;
-            s.file_count += 1;
-        }
-        None => {
-            index.insert(buf_key.to_owned(), stats.len());
-            stats.push(ExtensionStat {
-                extension: buf_key.to_owned(),
-                disk_size: node.disk_size,
-                size: node.size,
-                file_count: 1,
-            });
-        }
-    };
-    let mut buf = [0u8; EXT_BUF];
-    visit_files(root, &mut |node| {
+    // The walk is parallel, so the table lives behind one lock; the number of
+    // distinct extensions is small, so contention stays low.
+    let table = Mutex::new((Vec::<ExtensionStat>::new(), HashMap::<String, usize>::new()));
+    visit_files_par(root, &|node| {
         let name = node.name.as_str();
-        match lower_ext(name, &mut buf) {
-            Some(ext) => add(ext, node),
-            None => add(&extension(name), node),
+        let mut buf = [0u8; EXT_BUF];
+        let ext = match lower_ext(name, &mut buf) {
+            Some(ext) => ext.to_owned(),
+            None => extension(name),
+        };
+        let mut t = table.lock().unwrap();
+        let (stats, index) = &mut *t;
+        // Extension -> index into `stats`. Looked up with a borrowed &str so the
+        // common case (an extension we have already seen) allocates nothing.
+        match index.get(ext.as_str()) {
+            Some(&i) => {
+                let s = &mut stats[i];
+                s.disk_size += node.disk_size;
+                s.size += node.size;
+                s.file_count += 1;
+            }
+            None => {
+                index.insert(ext.clone(), stats.len());
+                stats.push(ExtensionStat {
+                    extension: ext,
+                    disk_size: node.disk_size,
+                    size: node.size,
+                    file_count: 1,
+                });
+            }
         }
     });
-    let mut out = stats;
+    let mut out = table.into_inner().unwrap().0;
     // Sorted by size; ties by extension so the output is stable between runs.
     out.sort_unstable_by(|a, b| {
         b.size_by(mode)
@@ -388,19 +394,16 @@ pub struct AgeStat {
 
 /// How much data was last modified in each age bucket (TreeSize's "age of files").
 pub fn by_age(root: &Node) -> Vec<AgeStat> {
-    let mut stats: Vec<AgeStat> = AGE_BUCKETS
+    // One atomic triple per bucket: the walk is parallel, and there are only
+    // eight buckets, so this stays cheap and lock-free.
+    let stats: Vec<(String, AtomicU64, AtomicU64, AtomicU64)> = AGE_BUCKETS
         .iter()
         .map(|(l, _)| *l)
         .chain(std::iter::once("unknown"))
-        .map(|bucket| AgeStat {
-            bucket: bucket.into(),
-            disk_size: 0,
-            size: 0,
-            file_count: 0,
-        })
+        .map(|bucket| (bucket.into(), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)))
         .collect();
     let now = unix_now();
-    visit_files(root, &mut |node| {
+    visit_files_par(root, &|node| {
         let idx = match node_age_days(node, now) {
             Some(days) => AGE_BUCKETS
                 .iter()
@@ -409,12 +412,20 @@ pub fn by_age(root: &Node) -> Vec<AgeStat> {
             // No timestamp, or modified in the future.
             None => AGE_BUCKETS.len(),
         };
-        let s = &mut stats[idx];
-        s.disk_size += node.disk_size;
-        s.size += node.size;
-        s.file_count += 1;
+        let (_, disk, size, count) = &stats[idx];
+        disk.fetch_add(node.disk_size, std::sync::atomic::Ordering::Relaxed);
+        size.fetch_add(node.size, std::sync::atomic::Ordering::Relaxed);
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     });
     stats
+        .into_iter()
+        .map(|(bucket, disk, size, count)| AgeStat {
+            bucket,
+            disk_size: disk.into_inner(),
+            size: size.into_inner(),
+            file_count: count.into_inner(),
+        })
+        .collect()
 }
 
 /// Format Unix seconds as `YYYY-MM-DD HH:MM:SS` (UTC).

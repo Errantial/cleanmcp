@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0 - 2026-11-04
+
+Faster breakdowns on big trees, and small CLI/MCP conveniences. One breaking change: the shape
+of `suggest --json`, called out under CLI; the snapshot format is unchanged.
+
+### Speed
+- `ext` and `age` now walk the tree in parallel (rayon) instead of single-threaded. On a
+  249k-file tree the aggregation itself drops from seconds to milliseconds; the scan still
+  dominates wall time. `by_age` accumulates into per-bucket atomics, `by_extension` into one
+  locked table (few distinct extensions, so contention is low).
+
+### CLI
+- **Breaking:** `suggest --json` is now an object with `total_count`, `total_size`,
+  `total_size_human` and `candidates` (previously a bare array), matching the MCP tool's totals.
+- `files` gains `--sort size|name|age` (default `size`). The top `--top` files are still picked
+  by size; the flag only orders the rows shown.
+
+### MCP server
+- `list_drives` takes an optional `include_virtual` flag to also list pseudo filesystems
+  (tmpfs, squashfs, ...), matching the CLI's `drives --all`.
+
 ## 0.4.0 - 2026-11-04
 
 Agent-facing improvements: every MCP read tool can now report apparent (logical) sizes, and two

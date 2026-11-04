@@ -173,6 +173,12 @@ pub struct PathParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct DrivesParams {
+    /// Also list pseudo filesystems (tmpfs, squashfs, ...).
+    pub include_virtual: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct ChildrenParams {
     pub path: String,
     /// Levels to expand (default 1, max 4).
@@ -504,8 +510,12 @@ impl CleanMcp {
         description = "List drives / mounted volumes with total, used and free space. A good first call.",
         annotations(read_only_hint = true)
     )]
-    async fn list_drives(&self) -> Result<Json<DrivesResult>, String> {
-        let drives = tokio::task::spawn_blocking(|| drives::list_drives(false))
+    async fn list_drives(
+        &self,
+        Parameters(p): Parameters<DrivesParams>,
+    ) -> Result<Json<DrivesResult>, String> {
+        let all = p.include_virtual.unwrap_or(false);
+        let drives = tokio::task::spawn_blocking(move || drives::list_drives(all))
             .await
             .map_err(|e| e.to_string())?;
         Ok(Json(DrivesResult { drives }))

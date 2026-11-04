@@ -116,6 +116,18 @@ enum ExportFormat {
     Json,
 }
 
+/// How to order the rows a query prints.
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum SortBy {
+    /// Largest first (default).
+    #[default]
+    Size,
+    /// Alphabetical by path.
+    Name,
+    /// Oldest first.
+    Age,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Browse interactively: navigate, mark and move items to the trash.
@@ -154,6 +166,9 @@ enum Command {
         /// Only these extensions, e.g. `--ext iso,zip`.
         #[arg(long, value_delimiter = ',')]
         ext: Vec<String>,
+        /// Order of the rows shown (the top `--top` files are still picked by size).
+        #[arg(long, value_enum, default_value_t = SortBy::Size)]
+        sort: SortBy,
         #[arg(long)]
         json: bool,
     },
@@ -375,6 +390,7 @@ fn main() -> Result<()> {
             older_than,
             newer_than,
             ext,
+            sort,
             json,
         } => {
             let cfg = config()?;
@@ -385,7 +401,12 @@ fn main() -> Result<()> {
                 newer_than_days: newer_than,
                 extensions: ext,
             };
-            let files = query::largest_files(&s.tree, &s.root, top, &filter, scan.mode());
+            let mut files = query::largest_files(&s.tree, &s.root, top, &filter, scan.mode());
+            match sort {
+                SortBy::Size => {}
+                SortBy::Name => files.sort_by(|a, b| a.path.cmp(&b.path)),
+                SortBy::Age => files.sort_by_key(|f| std::cmp::Reverse(f.age_days)),
+            }
             if json {
                 output::print_json(&files)
             } else {
@@ -443,7 +464,7 @@ fn main() -> Result<()> {
             let s = scan.run(&cfg)?;
             let c = rules::find_candidates(&rules, &s.tree, &s.root, min_size, scan.mode());
             if json {
-                output::print_json(&c)
+                output::print_json(&output::SuggestJson::build(c, scan.mode()))
             } else {
                 output::print_candidates(&c, scan.mode());
                 Ok(())

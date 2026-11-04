@@ -141,6 +141,27 @@ pub fn print_extensions(stats: &[ExtensionStat], root: &Node, mode: SizeMode) {
     }
 }
 
+/// JSON document for `suggest --json`: totals over every match, plus the list.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct SuggestJson {
+    pub total_count: usize,
+    pub total_size: u64,
+    pub total_size_human: String,
+    pub candidates: Vec<Candidate>,
+}
+
+impl SuggestJson {
+    pub fn build(c: Vec<Candidate>, mode: SizeMode) -> Self {
+        let total_size = c.iter().map(|x| x.entry.size_by(mode)).sum();
+        SuggestJson {
+            total_count: c.len(),
+            total_size,
+            total_size_human: human(total_size),
+            candidates: c,
+        }
+    }
+}
+
 pub fn print_candidates(c: &[Candidate], mode: SizeMode) {
     if c.is_empty() {
         println!("No cleanup candidates found.");
