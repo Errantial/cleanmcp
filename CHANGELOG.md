@@ -38,7 +38,23 @@ CLI flags are unchanged.
   `\\?\` prefixes are well formed.
 
 ### CLI
+- `dupes` now prices each copy and the wasted total in the selected size mode: the default reports
+  space used on disk (matching the rest of the tool) and `--apparent` reports logical lengths.
+  Grouping still uses the logical length, which identical content requires.
+- **Breaking:** `dupes --json` is now an object with `total_groups`, `total_wasted` and `groups`
+  instead of a bare array, so a truncated page no longer hides how many groups exist or what they
+  total. Every group also reports `disk_size` and `wasted_disk_size`; the MCP `find_duplicates`
+  groups gain those two fields (additive) and keep their logical totals.
+- `tree --json` nodes gained `children_truncated` (the depth limit or `top` left children out, so
+  an empty `children` list no longer looks like an empty folder) and `other_size` (the omitted
+  children in the selected size mode). Omitted-children totals now also cover folders below the
+  depth limit, not only the tail cut by `top`. `list_children` in the MCP server shares this shape,
+  so it gains both fields and reports the omitted children at its depth limit too.
 - An explicit `--config` path that does not exist now errors instead of silently using defaults.
+- An invalid `--exclude` glob now says the pattern is invalid instead of "cannot scan <path>",
+  which blamed the folder for a typo.
+- `diff <directory>` now says it needs a snapshot file instead of "cannot read <dir>: access is
+  denied".
 
 ### Build
 - `rust-version` is 1.88 (the code uses let-chains, stabilized there) and CI compiles that version.
