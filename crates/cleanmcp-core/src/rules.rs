@@ -4,12 +4,13 @@
 //! and why before anything is removed. Users can add rules and disable
 //! built-in ones in the config file (see [`crate::config`]).
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
 
-use crate::query::Entry;
+use crate::query::{Entry, NAME_BUF, lower_into};
 use crate::tree::Node;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -238,36 +239,63 @@ pub fn builtin_rules() -> Vec<Rule> {
     BUILTIN.iter().map(Rule::from).collect()
 }
 
+/// One compiled `path` rule.
+struct PathRule {
+    /// Index into [`RuleSet::rules`].
+    rule: usize,
+    glob: GlobMatcher,
+}
+
 /// Compiled rule set ready for matching.
+///
+/// Matching a directory is the hot path of `suggest` on a big scan, so the
+/// rules are indexed instead of being tested one by one: `dir_name` rules by
+/// name, `path` rules by the literal last segment of their glob. Only the few
+/// rules that can possibly match a given name get their glob evaluated.
 pub struct RuleSet {
     rules: Vec<Rule>,
-    /// Globs for the rules that have a `path`; `path_rule[i]` is the rule index of glob `i`.
-    paths: GlobSet,
-    path_rule: Vec<usize>,
+    /// `dir_name` rules by lowercased name; rule indices, ascending.
+    by_name: HashMap<String, Vec<usize>>,
+    /// `path` rules whose glob ends in a literal segment, by lowercased segment.
+    by_suffix: HashMap<String, Vec<PathRule>>,
+    /// `path` rules whose glob ends in a wildcard: checked for every directory.
+    any_suffix: Vec<PathRule>,
 }
 
 impl RuleSet {
     /// Compile `rules`. Rules for other operating systems are dropped.
     pub fn new(rules: Vec<Rule>) -> Result<Self, globset::Error> {
         let rules: Vec<Rule> = rules.into_iter().filter(|r| r.os.applies()).collect();
-        let mut b = GlobSetBuilder::new();
-        let mut path_rule = Vec::new();
+        let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_suffix: HashMap<String, Vec<PathRule>> = HashMap::new();
+        let mut any_suffix: Vec<PathRule> = Vec::new();
         for (i, r) in rules.iter().enumerate() {
-            if let Some(p) = &r.path {
+            if let Some(name) = &r.dir_name {
+                by_name.entry(name.to_lowercase()).or_default().push(i);
+            } else if let Some(p) = &r.path {
                 let p = p.replace('\\', "/");
-                b.add(
-                    GlobBuilder::new(&p)
-                        .case_insensitive(true)
-                        .literal_separator(true)
-                        .build()?,
-                );
-                path_rule.push(i);
+                let glob = GlobBuilder::new(&p)
+                    .case_insensitive(true)
+                    .literal_separator(true)
+                    .build()?
+                    .compile_matcher();
+                let last = p.rsplit('/').next().unwrap_or("");
+                let path_rule = PathRule { rule: i, glob };
+                if !last.is_empty() && !last.contains(['*', '?', '[', '{', ']', '}']) {
+                    by_suffix
+                        .entry(last.to_lowercase())
+                        .or_default()
+                        .push(path_rule);
+                } else {
+                    any_suffix.push(path_rule);
+                }
             }
         }
         Ok(RuleSet {
-            paths: b.build()?,
             rules,
-            path_rule,
+            by_name,
+            by_suffix,
+            any_suffix,
         })
     }
 
@@ -281,28 +309,33 @@ impl RuleSet {
     }
 
     fn matching(&self, parent: &Node, dir: &Node, path: &Path) -> Option<&Rule> {
-        self.matching_with(&dir.name, dir, path, |s| has_child(parent, s))
+        self.matching_with(dir.name.as_str(), dir, path, &mut |s| has_child(parent, s))
     }
 
     /// Like `matching`, for a directory whose parent is not in the tree (the scan
-    /// root): sibling requirements are checked on disk.
+    /// root): sibling requirements are checked on disk, and only if a rule
+    /// actually needs them.
     fn matching_root(&self, dir: &Node, path: &Path) -> Option<&Rule> {
-        let siblings: Vec<String> = path
-            .parent()
-            .and_then(|p| std::fs::read_dir(p).ok())
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut siblings: Option<Vec<String>> = None;
         // The root node is named by its full path; match on the folder name.
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_default();
-        self.matching_with(&name, dir, path, |s| {
-            siblings.iter().any(|n| name_matches(n, s))
+        self.matching_with(&name, dir, path, &mut |s| {
+            siblings
+                .get_or_insert_with(|| {
+                    path.parent()
+                        .and_then(|p| std::fs::read_dir(p).ok())
+                        .map(|rd| {
+                            rd.flatten()
+                                .map(|e| e.file_name().to_string_lossy().into_owned())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .iter()
+                .any(|n| name_matches(n, s))
         })
     }
 
@@ -311,25 +344,56 @@ impl RuleSet {
         name: &str,
         dir: &Node,
         path: &Path,
-        has_sibling: impl Fn(&str) -> bool,
+        has_sibling: &mut impl FnMut(&str) -> bool,
     ) -> Option<&Rule> {
-        let mut path_hits: Option<Vec<usize>> = None;
-        self.rules.iter().enumerate().find_map(|(i, r)| {
-            let hit = match (&r.dir_name, &r.path) {
-                (Some(rule_name), _) => name.eq_ignore_ascii_case(rule_name),
-                (None, Some(_)) => path_hits
-                    .get_or_insert_with(|| self.paths.matches(path))
-                    .iter()
-                    .any(|&h| self.path_rule[h] == i),
-                _ => false,
-            };
-            let ok = hit
-                && (r.requires_sibling.is_empty()
-                    || r.requires_sibling.iter().any(|s| has_sibling(s)))
-                && (r.requires_child.is_empty()
-                    || r.requires_child.iter().any(|s| has_child(dir, s)));
-            ok.then_some(r)
-        })
+        let mut buf = [0u8; NAME_BUF];
+        let lowered;
+        let lower = match lower_into(name, &mut buf) {
+            Some(s) => s,
+            None => {
+                lowered = name.to_lowercase();
+                &lowered
+            }
+        };
+        // Lowest matching rule index wins (built-in order puts specific rules first).
+        let mut best: Option<usize> = None;
+        if let Some(indices) = self.by_name.get(lower) {
+            for &i in indices {
+                if best.is_some_and(|b| i >= b) {
+                    break;
+                }
+                if self.requirements_ok(i, dir, has_sibling) {
+                    best = Some(i);
+                    break;
+                }
+            }
+        }
+        let path_rules = self
+            .by_suffix
+            .get(lower)
+            .into_iter()
+            .flatten()
+            .chain(self.any_suffix.iter());
+        for pr in path_rules {
+            if best.is_some_and(|b| pr.rule >= b) {
+                continue;
+            }
+            if pr.glob.is_match(path) && self.requirements_ok(pr.rule, dir, has_sibling) {
+                best = Some(pr.rule);
+            }
+        }
+        best.map(|i| &self.rules[i])
+    }
+
+    fn requirements_ok(
+        &self,
+        i: usize,
+        dir: &Node,
+        has_sibling: &mut impl FnMut(&str) -> bool,
+    ) -> bool {
+        let r = &self.rules[i];
+        (r.requires_sibling.is_empty() || r.requires_sibling.iter().any(|s| has_sibling(s)))
+            && (r.requires_child.is_empty() || r.requires_child.iter().any(|s| has_child(dir, s)))
     }
 }
 
@@ -365,13 +429,17 @@ pub struct Candidate {
 pub fn find_candidates(rules: &RuleSet, root: &Node, base: &Path, min_size: u64) -> Vec<Candidate> {
     let mut out = Vec::new();
     // The scan root itself can match too (e.g. scanning ~/.npm/_cacache directly).
-    match rules.matching_root(root, base) {
-        Some(r) if root.is_dir() => {
+    let root_match = root
+        .is_dir()
+        .then(|| rules.matching_root(root, base))
+        .flatten();
+    match root_match {
+        Some(r) => {
             if root.disk_size >= min_size {
                 out.push(candidate(r, base, root));
             }
         }
-        _ => visit(rules, root, base, min_size, &mut out),
+        None => visit(rules, root, &mut base.to_path_buf(), min_size, &mut out),
     }
     out.sort_unstable_by_key(|c| std::cmp::Reverse(c.entry.disk_size));
     out
@@ -387,7 +455,13 @@ fn candidate(r: &Rule, path: &Path, n: &Node) -> Candidate {
     }
 }
 
-fn visit(rules: &RuleSet, node: &Node, path: &Path, min_size: u64, out: &mut Vec<Candidate>) {
+fn visit(
+    rules: &RuleSet,
+    node: &Node,
+    path: &mut PathBuf,
+    min_size: u64,
+    out: &mut Vec<Candidate>,
+) {
     for child in node.children.iter() {
         // Children are sorted by disk size, so everything after this is smaller too.
         if child.disk_size < min_size {
@@ -396,11 +470,12 @@ fn visit(rules: &RuleSet, node: &Node, path: &Path, min_size: u64, out: &mut Vec
         if !child.is_dir() {
             continue;
         }
-        let child_path = path.join(child.name.as_str());
-        match rules.matching(node, child, &child_path) {
-            Some(rule) => out.push(candidate(rule, &child_path, child)),
-            None => visit(rules, child, &child_path, min_size, out),
+        path.push(child.name.as_str());
+        match rules.matching(node, child, path) {
+            Some(rule) => out.push(candidate(rule, path, child)),
+            None => visit(rules, child, path, min_size, out),
         }
+        path.pop();
     }
 }
 

@@ -45,6 +45,18 @@ impl Sort {
     }
 }
 
+/// Case-insensitive name order, equivalent to comparing `to_lowercase()`
+/// strings but without allocating one per comparison for ASCII names.
+fn cmp_name_ci(a: &str, b: &str) -> std::cmp::Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        a.bytes()
+            .map(|c| c.to_ascii_lowercase())
+            .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+    } else {
+        a.to_lowercase().cmp(&b.to_lowercase())
+    }
+}
+
 pub struct App {
     pub scan: Scan,
     /// Child names from the scan root down to the directory being shown.
@@ -121,11 +133,15 @@ impl App {
         let mut v: Vec<usize> = (0..node.children.len()).collect();
         let c = &node.children;
         match sort {
-            Sort::Size => v.sort_by_key(|&i| std::cmp::Reverse(c[i].size_by(mode))),
-            Sort::Files => v.sort_by_key(|&i| std::cmp::Reverse(c[i].file_count)),
+            // The scanner keeps children sorted by size on disk, so the default
+            // view needs no sorting at all - even in a folder with 100k entries.
+            Sort::Size if mode == SizeMode::Disk => {}
+            Sort::Size => v.sort_unstable_by_key(|&i| std::cmp::Reverse(c[i].size_by(mode))),
+            Sort::Files => v.sort_unstable_by_key(|&i| std::cmp::Reverse(c[i].file_count)),
             // Unknown times go last, not first.
-            Sort::Age => v.sort_by_key(|&i| (c[i].mtime == NO_TIME, c[i].mtime)),
-            Sort::Name => v.sort_by_cached_key(|&i| c[i].name.to_lowercase()),
+            Sort::Age => v.sort_unstable_by_key(|&i| (c[i].mtime == NO_TIME, c[i].mtime)),
+            // Stable, and without lowercasing every name into a new String.
+            Sort::Name => v.sort_by(|&a, &b| cmp_name_ci(&c[a].name, &c[b].name)),
         }
         self.view = v;
         let len = self.view.len();
