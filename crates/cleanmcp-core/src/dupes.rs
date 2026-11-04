@@ -89,7 +89,7 @@ pub fn same_size_files(root: &Node, base: &Path, opts: &DupeOptions) -> Vec<(u64
     // Biggest files first: the hashing pass is I/O bound and this order gives the
     // long reads to the pool before the short ones.
     let mut out: Vec<(u64, Vec<PathBuf>)> = by_size.into_iter().collect();
-    out.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    out.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
     out
 }
 
@@ -218,7 +218,7 @@ fn full_pass(
         return;
     }
     // Longest work first, so the pool is not left waiting on one huge group.
-    pending.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    pending.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
 
     let mut tasks: Vec<Task> = Vec::new();
     for (gi, (_, idxs)) in pending.iter().enumerate() {
@@ -392,7 +392,11 @@ mod tests {
     use std::fs;
 
     fn group_hashes(group: &DuplicateGroup) -> Vec<String> {
-        let mut v: Vec<String> = group.paths.iter().map(|p| p.display().to_string()).collect();
+        let mut v: Vec<String> = group
+            .paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
         v.sort();
         v
     }
@@ -438,7 +442,10 @@ mod tests {
         let g = find_duplicates(&s.tree, &s.root, &DupeOptions { min_size: 1 });
         assert_eq!(g.len(), 1);
         let names = group_hashes(&g[0]);
-        assert!(names[0].ends_with('a') && names[1].ends_with('b'), "{names:?}");
+        assert!(
+            names[0].ends_with('a') && names[1].ends_with('b'),
+            "{names:?}"
+        );
     }
 
     #[test]

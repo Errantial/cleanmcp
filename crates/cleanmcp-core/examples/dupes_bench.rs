@@ -15,7 +15,11 @@ fn main() {
 
     let t = Instant::now();
     let s = scan(&path, &ScanOptions::default()).unwrap();
-    eprintln!("scan: {:.2}s ({} entries)", t.elapsed().as_secs_f64(), count(&s.tree));
+    eprintln!(
+        "scan: {:.2}s ({} entries)",
+        t.elapsed().as_secs_f64(),
+        count(&s.tree)
+    );
 
     let t = Instant::now();
     let cands = dupes::same_size_files(&s.tree, &s.root, &DupeOptions { min_size });

@@ -291,8 +291,7 @@ impl PathRule {
 /// use the first one that is not a bare wildcard. `None` means "always run the
 /// glob" (nothing literal to check).
 fn glob_anchor(pattern: &str) -> Option<(usize, Anchor)> {
-    let mut depth = 0;
-    for segment in pattern.rsplit('/') {
+    for (depth, segment) in pattern.rsplit('/').enumerate() {
         if segment.is_empty() {
             // Trailing separator or similar: do not assume anything.
             return None;
@@ -315,7 +314,6 @@ fn glob_anchor(pattern: &str) -> Option<(usize, Anchor)> {
         if segment != "*" {
             return None;
         }
-        depth += 1;
     }
     None
 }
@@ -487,7 +485,9 @@ impl RuleSet {
 
 /// Does `dir` directly contain an entry called `pattern` (`*.ext` allowed)?
 fn has_child(dir: &Node, pattern: &str) -> bool {
-    dir.children().iter().any(|c| name_matches(&c.name, pattern))
+    dir.children()
+        .iter()
+        .any(|c| name_matches(&c.name, pattern))
 }
 
 /// Case-insensitive name match; `*.ext` matches any name ending in `.ext`.

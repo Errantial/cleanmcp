@@ -50,7 +50,8 @@ fn main() {
     println!("scan                   {scan_ms:.0} ms");
     println!(
         "entries                {} files, {} dirs",
-        s.tree.file_count(), s.tree.dir_count()
+        s.tree.file_count(),
+        s.tree.dir_count()
     );
     best("walk_only", || {
         let mut n = 0u64;

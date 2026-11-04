@@ -799,7 +799,10 @@ mod tests {
         assert_eq!(shallow.tree.disk_size, s.tree.disk_size);
         let a = shallow.find(Path::new("a")).unwrap();
         assert_eq!(a.disk_size, s.find(Path::new("a")).unwrap().disk_size);
-        assert!(a.children().is_empty(), "children below depth 1 are dropped");
+        assert!(
+            a.children().is_empty(),
+            "children below depth 1 are dropped"
+        );
 
         // Diffing the truncated snapshot gives the same result as diffing the
         // full one, as long as `depth` does not go below the truncation.

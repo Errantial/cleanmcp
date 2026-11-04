@@ -75,7 +75,11 @@ mod imp {
             } else {
                 NodeKind::Other
             };
-            let size = if kind == NodeKind::File { meta.len() } else { 0 };
+            let size = if kind == NodeKind::File {
+                meta.len()
+            } else {
+                0
+            };
             FsEntry {
                 name,
                 raw,
@@ -268,7 +272,11 @@ mod imp {
             FsEntry {
                 name,
                 kind,
-                size: if kind == NodeKind::File { size as u64 } else { 0 },
+                size: if kind == NodeKind::File {
+                    size as u64
+                } else {
+                    0
+                },
                 mtime: mtime_to_u32(filetime_to_unix(write_time as u64)),
                 attrs,
             }
@@ -289,7 +297,11 @@ mod imp {
             } else {
                 NodeKind::File
             };
-            let size = if kind == NodeKind::File { meta.len() } else { 0 };
+            let size = if kind == NodeKind::File {
+                meta.len()
+            } else {
+                0
+            };
             FsEntry {
                 name,
                 kind,
@@ -395,7 +407,7 @@ mod imp {
     /// directory. `try_borrow_mut` keeps the code panic-free if it is ever re-entered.
     fn with_dir_buffer<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
         thread_local! {
-            static BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+            static BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
         }
         BUFFER.with(|cell| match cell.try_borrow_mut() {
             Ok(mut buf) => {
@@ -455,7 +467,10 @@ mod imp {
             };
             // SAFETY: the record's file name occupies `name_len` bytes inside `buf`.
             let units = unsafe {
-                std::slice::from_raw_parts((&raw const (*info).FileName).cast::<u16>(), name_len / 2)
+                std::slice::from_raw_parts(
+                    (&raw const (*info).FileName).cast::<u16>(),
+                    name_len / 2,
+                )
             };
             if !matches!(units, [46] | [46, 46]) {
                 name.clear();
@@ -467,7 +482,8 @@ mod imp {
                     scratch.push(&*name);
                     match fs::symlink_metadata(&*scratch) {
                         Ok(meta) => {
-                            let e = FsEntry::from_meta(name, OsStr::new(""), &meta, meta_mtime(&meta));
+                            let e =
+                                FsEntry::from_meta(name, OsStr::new(""), &meta, meta_mtime(&meta));
                             f(&e);
                         }
                         Err(_) => errors += 1,
@@ -679,4 +695,3 @@ mod windows_tests {
         assert_eq!(count, 0);
     }
 }
-
