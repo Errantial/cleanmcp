@@ -39,8 +39,8 @@ pub fn print_tree(s: &Scan, depth: usize, top: usize, mode: SizeMode) {
         "{} {label}  {}  ({} files, {} dirs, {} ms)",
         human(s.tree.size_by(mode)),
         s.root.display(),
-        s.tree.file_count,
-        s.tree.dir_count,
+        s.tree.file_count(),
+        s.tree.dir_count(),
         s.elapsed_ms
     );
     print_children(&s.tree, "", depth, top, mode);
@@ -48,10 +48,10 @@ pub fn print_tree(s: &Scan, depth: usize, top: usize, mode: SizeMode) {
 
 pub fn print_scan_notes(s: &Scan) {
     let st = &s.stats;
-    if s.tree.errors > 0 {
+    if s.tree.errors() > 0 {
         eprintln!(
             "note: {} entries could not be read (permission denied?)",
-            s.tree.errors
+            s.tree.errors()
         );
     }
     if st.hardlinks_deduped > 0 {
@@ -89,7 +89,7 @@ fn print_children(node: &Node, indent: &str, depth: usize, top: usize, mode: Siz
         } else {
             ("├─ ", "│  ")
         };
-        let suffix = match c.kind {
+        let suffix = match c.kind() {
             NodeKind::Dir => "/",
             NodeKind::Link => " ->",
             _ => "",
@@ -216,9 +216,9 @@ impl TreeJson {
             disk_size: node.disk_size,
             size: node.size,
             is_dir: node.is_dir(),
-            file_count: node.file_count as u64,
+            file_count: node.file_count() as u64,
             age_days: node.age().map(|d| d.as_secs() / 86_400),
-            errors: node.errors,
+            errors: node.errors(),
             other_disk_size,
             other_count,
             children,
@@ -409,13 +409,13 @@ pub fn export_csv(s: &Scan, o: &ExportOptions, w: &mut dyn Write) -> Result<()> 
             w,
             "{},{},{},{},{},{},{}",
             csv_field(&p.to_string_lossy()),
-            kind_str(n.kind),
+            kind_str(n.kind()),
             n.disk_size,
             n.size,
-            n.file_count,
-            n.dir_count,
+            n.file_count(),
+            n.dir_count(),
             n.modified()
-                .map(|_| format_time(n.mtime))
+                .map(|_| format_time(n.mtime_unix()))
                 .unwrap_or_default()
         )
     })?;
@@ -444,12 +444,12 @@ pub fn export_json(s: &Scan, o: &ExportOptions, w: &mut dyn Write) -> Result<()>
         first = false;
         let row = ExportRow {
             path: p.to_string_lossy().into_owned(),
-            kind: kind_str(n.kind),
+            kind: kind_str(n.kind()),
             disk_size: n.disk_size,
             size: n.size,
-            file_count: n.file_count,
-            dir_count: n.dir_count,
-            modified_utc: n.modified().map(|_| format_time(n.mtime)),
+            file_count: n.file_count(),
+            dir_count: n.dir_count(),
+            modified_utc: n.modified().map(|_| format_time(n.mtime_unix())),
         };
         serde_json::to_writer(&mut *w, &row).map_err(std::io::Error::other)
     })?;

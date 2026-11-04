@@ -450,7 +450,7 @@ fn main() -> Result<()> {
             snapshot::save(&s, &out).with_context(|| format!("cannot write {}", out.display()))?;
             eprintln!(
                 "Saved {} entries ({} on disk) to {}",
-                s.tree.file_count as u64 + s.tree.dir_count as u64,
+                s.tree.file_count() as u64 + s.tree.dir_count() as u64,
                 output::human(s.tree.disk_size),
                 out.display()
             );
