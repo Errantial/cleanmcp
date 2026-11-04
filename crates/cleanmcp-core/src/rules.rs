@@ -335,7 +335,9 @@ impl RuleSet {
 
 /// Does `dir` directly contain an entry called `pattern` (`*.ext` allowed)?
 fn has_child(dir: &Node, pattern: &str) -> bool {
-    dir.children.iter().any(|c| name_matches(&c.name, pattern))
+    dir.children()
+        .iter()
+        .any(|c| name_matches(&c.name, pattern))
 }
 
 /// Case-insensitive name match; `*.ext` matches any name ending in `.ext`.
@@ -388,7 +390,7 @@ fn candidate(r: &Rule, path: &Path, n: &Node) -> Candidate {
 }
 
 fn visit(rules: &RuleSet, node: &Node, path: &Path, min_size: u64, out: &mut Vec<Candidate>) {
-    for child in node.children.iter() {
+    for child in node.children().iter() {
         // Children are sorted by disk size, so everything after this is smaller too.
         if child.disk_size < min_size {
             break;

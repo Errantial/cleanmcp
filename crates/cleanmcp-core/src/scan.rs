@@ -12,7 +12,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 
 use crate::os::{self, FileId, FsInfo};
-use crate::tree::{NO_TIME, Node, NodeKind, Scan, ScanSettings, ScanStats};
+use crate::tree::{NO_TIME, Node, NodeKind, Scan, ScanSettings, ScanStats, mtime_to_u32};
 
 /// Live counters and a cancel switch shared with a running scan.
 #[derive(Debug, Default)]
@@ -151,11 +151,12 @@ pub fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-fn mtime(meta: &fs::Metadata) -> i64 {
+fn mtime(meta: &fs::Metadata) -> u32 {
     match meta.modified() {
         Ok(t) => match t.duration_since(UNIX_EPOCH) {
-            Ok(d) => d.as_secs() as i64,
-            Err(e) => -(e.duration().as_secs() as i64),
+            Ok(d) => mtime_to_u32(d.as_secs().min(i64::MAX as u64) as i64),
+            // Before 1970: store the epoch (age queries see "very old" either way).
+            Err(_) => 0,
         },
         Err(_) => NO_TIME,
     }
@@ -185,17 +186,9 @@ fn file_node(ctx: &Ctx, path: &Path, name: CompactString, meta: &fs::Metadata) -
     }
     ctx.opts.control.entries.fetch_add(1, Relaxed);
     ctx.opts.control.bytes.fetch_add(disk, Relaxed);
-    Node {
-        name,
-        size,
-        disk_size: disk,
-        mtime: mtime(meta),
-        file_count: (kind == NodeKind::File) as u32,
-        dir_count: 0,
-        errors: 0,
-        kind,
-        children: Box::new([]),
-    }
+    let mut node = Node::new(kind, name, size, disk, mtime(meta));
+    node.set_counts((kind == NodeKind::File) as u32, 0, 0);
+    node
 }
 
 fn is_excluded(ctx: &Ctx, path: &Path, name: &str) -> bool {
@@ -206,18 +199,8 @@ fn is_excluded(ctx: &Ctx, path: &Path, name: &str) -> bool {
     set.is_match(name) || set.is_match(path)
 }
 
-fn scan_dir(ctx: &Ctx, path: &Path, name: CompactString, mtime: i64) -> Node {
-    let mut node = Node {
-        name,
-        size: 0,
-        disk_size: 0,
-        mtime,
-        file_count: 0,
-        dir_count: 0,
-        errors: 0,
-        kind: NodeKind::Dir,
-        children: Box::new([]),
-    };
+fn scan_dir(ctx: &Ctx, path: &Path, name: CompactString, mtime: u32) -> Node {
+    let mut node = Node::new(NodeKind::Dir, name, 0, 0, mtime);
     ctx.opts.control.entries.fetch_add(1, Relaxed);
     if ctx.opts.control.is_cancelled() {
         return node;
@@ -226,16 +209,16 @@ fn scan_dir(ctx: &Ctx, path: &Path, name: CompactString, mtime: i64) -> Node {
     let entries = match fs::read_dir(path) {
         Ok(rd) => rd,
         Err(_) => {
-            node.errors = 1;
+            node.add_error();
             return node;
         }
     };
 
     let mut children = Vec::new();
-    let mut subdirs: Vec<(PathBuf, CompactString, i64)> = Vec::new();
+    let mut subdirs: Vec<(PathBuf, CompactString, u32)> = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else {
-            node.errors += 1;
+            node.add_error();
             continue;
         };
         let name = CompactString::from(entry.file_name().to_string_lossy());
@@ -260,7 +243,7 @@ fn scan_dir(ctx: &Ctx, path: &Path, name: CompactString, mtime: i64) -> Node {
                 subdirs.push((child_path, name, self::mtime(&meta)));
             }
             Ok(meta) => children.push(file_node(ctx, &child_path, name, &meta)),
-            Err(_) => node.errors += 1,
+            Err(_) => node.add_error(),
         }
     }
 
@@ -269,8 +252,10 @@ fn scan_dir(ctx: &Ctx, path: &Path, name: CompactString, mtime: i64) -> Node {
         .into_par_iter()
         .map(|(p, n, m)| scan_dir(ctx, &p, n, m))
         .collect();
+    // Size the buffer for exactly what goes in, so `into_boxed_slice` below needs no copy.
+    children.reserve_exact(dirs.len());
     children.extend(dirs);
-    node.children = children.into_boxed_slice();
+    node.set_children(children);
     node.finish_dir();
     node
 }
@@ -295,9 +280,9 @@ mod tests {
         let s = scan(dir.path(), &opts()).unwrap();
         assert_eq!(s.tree.size, 100_012);
         assert!(s.tree.disk_size >= 100_000);
-        assert_eq!(s.tree.file_count, 3);
-        assert_eq!(s.tree.dir_count, 2);
-        assert_eq!(&*s.tree.children[0].name, "a"); // largest first
+        assert_eq!(s.tree.file_count(), 3);
+        assert_eq!(s.tree.dir_count(), 2);
+        assert_eq!(&*s.tree.children()[0].name, "a"); // largest first
         assert_eq!(s.find(Path::new("a/b")).unwrap().size, 100_000);
         assert_eq!(s.find(&s.root.join("a").join("b")).unwrap().size, 100_000);
     }
@@ -348,7 +333,7 @@ mod tests {
         let s = scan(dir.path(), &opts()).unwrap();
         let apparent: Vec<_> = s.tree.sorted_children(crate::SizeMode::Apparent);
         assert_eq!(&*apparent[0].name, "one");
-        assert_eq!(&*s.tree.children[0].name, "many"); // disk order
+        assert_eq!(&*s.tree.children()[0].name, "many"); // disk order
     }
 
     #[test]
@@ -361,19 +346,31 @@ mod tests {
         let removed = s.remove(Path::new("a/b")).unwrap();
         assert_eq!(removed.size, 500);
         assert_eq!(s.tree.size, 5);
-        assert_eq!(s.tree.file_count, 1);
-        assert_eq!(s.tree.dir_count, 1);
+        assert_eq!(s.tree.file_count(), 1);
+        assert_eq!(s.tree.dir_count(), 1);
         assert!(s.find(Path::new("a/b")).is_none());
     }
 
     #[test]
-    fn node_stays_small() {
-        // A big drive holds millions of nodes; keep this from growing by accident.
-        assert!(
-            std::mem::size_of::<Node>() <= 80,
-            "{}",
-            std::mem::size_of::<Node>()
-        );
+    fn child_lists_are_exact_and_counts_packed() {
+        // A big drive holds millions of nodes: the node size and the way child
+        // lists are built are asserted together (see `tree::tests` for 64 bytes).
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("d1/d2")).unwrap();
+        for i in 0..100 {
+            fs::write(dir.path().join(format!("f{i}")), vec![1u8; 10]).unwrap();
+        }
+        fs::write(dir.path().join("d1/x"), vec![1u8; 20]).unwrap();
+        let s = scan(dir.path(), &opts()).unwrap();
+        // 100 files and 1 dir (d1) at the root; 2 dirs anywhere below it.
+        assert_eq!(s.tree.file_count(), 101);
+        assert_eq!(s.tree.dir_count(), 2);
+        assert_eq!(s.tree.children().len(), 101);
+        assert_eq!(s.find(Path::new("d1")).unwrap().file_count(), 1);
+        assert_eq!(s.find(Path::new("d1")).unwrap().dir_count(), 1);
+        // Children are sorted largest first; 100 small files outweigh one tiny dir.
+        assert!(s.tree.children()[0].is_file());
+        assert!(s.tree.children().iter().any(|c| c.is_dir()));
     }
 
     #[test]

@@ -349,7 +349,7 @@ impl CleanMcp {
         // A cached scan of a parent folder may have answered; report the folder asked for.
         let t = find(&s, &abs)?;
         let top_children = t
-            .children
+            .children()
             .iter()
             .take(15)
             .map(|c| Entry::from_node(&abs.join(c.name.as_str()), c))
@@ -360,9 +360,9 @@ impl CleanMcp {
             disk_size: t.disk_size,
             size: t.size,
             disk_size_human: human(t.disk_size),
-            file_count: t.file_count as u64,
-            dir_count: t.dir_count as u64,
-            errors: t.errors as u64,
+            file_count: t.file_count() as u64,
+            dir_count: t.dir_count() as u64,
+            errors: t.errors() as u64,
             elapsed_ms: s.elapsed_ms,
             scanned_at_utc: format_time(s.scanned_at),
             top_children,
@@ -693,8 +693,8 @@ impl ServerHandler for CleanMcp {
                     "root": s.root,
                     "disk_size": s.tree.disk_size,
                     "disk_size_human": human(s.tree.disk_size),
-                    "file_count": s.tree.file_count,
-                    "dir_count": s.tree.dir_count,
+                    "file_count": s.tree.file_count(),
+                    "dir_count": s.tree.dir_count(),
                     "scanned_at_utc": format_time(s.scanned_at),
                     "elapsed_ms": s.elapsed_ms,
                 })

@@ -30,7 +30,7 @@ impl Entry {
             disk_size: n.disk_size,
             size: n.size,
             is_dir: n.is_dir(),
-            file_count: n.file_count as u64,
+            file_count: n.file_count() as u64,
             age_days: n.age().map(|d| d.as_secs() / DAY),
         }
     }
@@ -58,7 +58,7 @@ pub struct FileFilter {
 
 impl FileFilter {
     pub fn matches(&self, node: &Node, mode: SizeMode) -> bool {
-        if node.kind != NodeKind::File {
+        if node.kind() != NodeKind::File {
             return false;
         }
         if self.min_size.is_some_and(|m| node.size_by(mode) < m) {
@@ -159,7 +159,7 @@ impl ExtensionStat {
 pub fn by_extension(root: &Node, n: usize, mode: SizeMode) -> Vec<ExtensionStat> {
     let mut map: HashMap<String, ExtensionStat> = HashMap::new();
     root.walk(Path::new(""), &mut |_, node| {
-        if node.kind == NodeKind::File {
+        if node.kind() == NodeKind::File {
             let e = map
                 .entry(extension(&node.name))
                 .or_insert_with_key(|k| ExtensionStat {
@@ -213,7 +213,7 @@ pub fn by_age(root: &Node) -> Vec<AgeStat> {
         })
         .collect();
     root.walk(Path::new(""), &mut |_, node| {
-        if node.kind != NodeKind::File {
+        if node.kind() != NodeKind::File {
             return;
         }
         let idx = match node.age() {

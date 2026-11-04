@@ -51,7 +51,7 @@ pub fn find_duplicates(root: &Node, base: &Path, opts: &DupeOptions) -> Vec<Dupl
 pub fn same_size_files(root: &Node, base: &Path, opts: &DupeOptions) -> Vec<(u64, Vec<PathBuf>)> {
     let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
     root.walk(base, &mut |p, n| {
-        if n.kind == NodeKind::File && n.size >= opts.min_size.max(1) {
+        if n.kind() == NodeKind::File && n.size >= opts.min_size.max(1) {
             by_size.entry(n.size).or_default().push(p.to_path_buf());
         }
     });

@@ -91,16 +91,16 @@ fn write_to(scan: &Scan, w: &mut impl Write) -> io::Result<()> {
             &mut *w,
             &(
                 depth,
-                kind_code(n.kind),
+                kind_code(n.kind()),
                 n.name.as_str(),
                 n.size,
                 n.disk_size,
-                n.mtime,
+                n.mtime_unix(),
                 own_errors(n),
             ),
         )?;
         w.write_all(b"\n")?;
-        for c in n.children.iter().rev() {
+        for c in n.children().iter().rev() {
             stack.push((depth + 1, c));
         }
     }
@@ -110,11 +110,11 @@ fn write_to(scan: &Scan, w: &mut impl Write) -> io::Result<()> {
 /// Errors recorded on this node itself (directories store the subtree total).
 fn own_errors(n: &Node) -> u32 {
     let below: u32 = n
-        .children
+        .children()
         .iter()
-        .map(|c| c.errors)
+        .map(|c| c.errors())
         .fold(0, u32::saturating_add);
-    n.errors.saturating_sub(below)
+    n.errors().saturating_sub(below)
 }
 
 /// Read a snapshot written by [`save`].
@@ -143,7 +143,7 @@ pub fn load(path: &Path) -> io::Result<Scan> {
     let mut root: Option<Node> = None;
     let close = |stack: &mut Vec<(Node, Vec<Node>)>, root: &mut Option<Node>| {
         let (mut node, kids) = stack.pop().expect("non-empty");
-        node.children = kids.into_boxed_slice();
+        node.set_children(kids);
         if node.is_dir() {
             node.finish_dir();
         }
@@ -173,17 +173,8 @@ pub fn load(path: &Path) -> io::Result<Scan> {
             close(&mut stack, &mut root);
         }
         let kind = kind_from(kind);
-        let node = Node {
-            name,
-            size,
-            disk_size: disk,
-            mtime,
-            file_count: (kind == NodeKind::File) as u32,
-            dir_count: 0,
-            errors,
-            kind,
-            children: Box::new([]),
-        };
+        let mut node = Node::new(kind, name, size, disk, crate::tree::mtime_to_u32(mtime));
+        node.set_counts((kind == NodeKind::File) as u32, 0, errors);
         stack.push((node, Vec::new()));
     }
     while !stack.is_empty() {
@@ -249,10 +240,10 @@ fn diff_rec(
     if depth > 0 && is_dir {
         let mut changed: Vec<(i64, Option<&Node>, Option<&Node>)> = Vec::new();
         let olds: std::collections::HashMap<&str, &Node> = old
-            .map(|n| n.children.iter().map(|c| (c.name.as_str(), c)).collect())
+            .map(|n| n.children().iter().map(|c| (c.name.as_str(), c)).collect())
             .unwrap_or_default();
         let mut seen = std::collections::HashSet::new();
-        for c in new.map(|n| &n.children[..]).unwrap_or_default() {
+        for c in new.map(|n| n.children()).unwrap_or_default() {
             seen.insert(c.name.as_str());
             let o = olds.get(c.name.as_str()).copied();
             let d = c.size_by(mode) as i64 - o.map_or(0, |o| o.size_by(mode) as i64);
@@ -309,8 +300,8 @@ mod tests {
             let loaded = load(&file).unwrap();
             assert_eq!(loaded.root, before.root);
             assert_eq!(loaded.tree.size, before.tree.size);
-            assert_eq!(loaded.tree.file_count, before.tree.file_count);
-            assert_eq!(loaded.tree.dir_count, before.tree.dir_count);
+            assert_eq!(loaded.tree.file_count(), before.tree.file_count());
+            assert_eq!(loaded.tree.dir_count(), before.tree.dir_count());
             assert_eq!(loaded.settings, before.settings);
             assert_eq!(loaded.find(Path::new("a/deep/er/f")).unwrap().size, 1000);
         }
