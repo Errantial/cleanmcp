@@ -587,25 +587,30 @@ mod tests {
     #[test]
     fn age_filters_use_whole_days() {
         // A file exactly 10 days old is "10 days" for both filters.
-        let now = unix_now();
         let node = |mtime: u32| {
             let mut n = Node::new(NodeKind::File, "f".into(), 1, 1, mtime);
             n.set_counts(1, 0, 0);
             n
         };
-        let ten_days = now - 10 * DAY as i64;
+        // Build a matcher per filter and take `ten_days` from its pinned clock.
+        // Going through `FileFilter::matches` re-reads the clock, so the
+        // "one second younger" case can drift over a day boundary mid-test.
         let f = FileFilter {
             older_than_days: Some(10),
             ..Default::default()
         };
-        assert!(f.matches(&node(ten_days as u32), SizeMode::Disk));
-        assert!(!f.matches(&node(ten_days as u32 + 1), SizeMode::Disk));
+        let m = super::Matcher::new(&f);
+        let ten_days = m.now - 10 * DAY as i64;
+        assert!(m.matches(&node(ten_days as u32), SizeMode::Disk));
+        assert!(!m.matches(&node(ten_days as u32 + 1), SizeMode::Disk));
         let f = FileFilter {
             newer_than_days: Some(10),
             ..Default::default()
         };
-        assert!(!f.matches(&node(ten_days as u32), SizeMode::Disk));
-        assert!(f.matches(&node(ten_days as u32 + 1), SizeMode::Disk));
+        let m = super::Matcher::new(&f);
+        let ten_days = m.now - 10 * DAY as i64;
+        assert!(!m.matches(&node(ten_days as u32), SizeMode::Disk));
+        assert!(m.matches(&node(ten_days as u32 + 1), SizeMode::Disk));
         // Unknown timestamps match neither filter.
         let unknown = node(NO_TIME);
         assert!(
