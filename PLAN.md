@@ -87,9 +87,11 @@ The CLI and MCP server both call `cleanmcp-core`, so their answers always match.
 - [x] End-to-end tests drive the real binary with the rmcp client (`crates/cleanmcp/tests/mcp_stdio.rs`)
 
 ### Milestone 5: distribution
-- [ ] Release workflow: build `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`; attach zips/tarballs to GitHub releases
-- [ ] `cargo install`, winget, Scoop, AUR, Homebrew (Linux)
-- [ ] Shell completions and man page via `clap_complete` / `clap_mangen`
+- [x] Release workflow (`.github/workflows/release.yml`): on a `v*` tag, builds `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` on native runners, packages zip / tar.gz with completions, man page and licenses, publishes a GitHub release with SHA256SUMS and notes from CHANGELOG.md
+- [x] Install scripts with checksum verification: `install.ps1` (Windows, adds to user PATH) and `install.sh` (Linux)
+- [x] `cargo install --git`; Scoop bucket manifest in this repo; AUR `PKGBUILD` (cleanmcp-bin) in `packaging/aur`
+- [x] Shell completions (`cleanmcp completions`) and man page (`cleanmcp man`)
+- [ ] Not done (needs accounts/approval outside this repo): crates.io publish, winget-pkgs PR, AUR upload, Homebrew tap
 
 ## Safety principles
 

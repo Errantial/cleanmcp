@@ -1,0 +1,27 @@
+# Maintainer: Errantial
+# AUR package for the prebuilt static binary. Not yet uploaded to the AUR.
+pkgname=cleanmcp-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="TreeSize-style disk usage CLI with a built-in MCP server for AI agents"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Errantial/cleanmcp"
+license=('MIT' 'Apache-2.0')
+provides=('cleanmcp')
+conflicts=('cleanmcp')
+source_x86_64=("$url/releases/download/v$pkgver/cleanmcp-$pkgver-x86_64-unknown-linux-musl.tar.gz")
+source_aarch64=("$url/releases/download/v$pkgver/cleanmcp-$pkgver-aarch64-unknown-linux-musl.tar.gz")
+sha256sums_x86_64=('HASH_X86_64_LINUX')
+sha256sums_aarch64=('HASH_AARCH64_LINUX')
+
+package() {
+    cd "cleanmcp-$pkgver-$CARCH-unknown-linux-musl"
+    install -Dm755 cleanmcp "$pkgdir/usr/bin/cleanmcp"
+    install -Dm644 cleanmcp.1 "$pkgdir/usr/share/man/man1/cleanmcp.1"
+    install -Dm644 completions/cleanmcp.bash "$pkgdir/usr/share/bash-completion/completions/cleanmcp"
+    install -Dm644 completions/_cleanmcp "$pkgdir/usr/share/zsh/site-functions/_cleanmcp"
+    install -Dm644 completions/cleanmcp.fish "$pkgdir/usr/share/fish/vendor_completions.d/cleanmcp.fish"
+    install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+    install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

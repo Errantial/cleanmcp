@@ -27,6 +27,8 @@ trash = "5.2.9"
 compact_str = "0.10.0"
 axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1"] }
 tokio-util = "0.7.20"
+clap_complete = "4.6.11"
+clap_mangen = "0.3.3"
 
 [dev-dependencies]
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }

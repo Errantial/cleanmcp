@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use cleanmcp_core::config::Config;
 use cleanmcp_core::query::FileFilter;
 use cleanmcp_core::{Scan, ScanOptions, SizeMode, drives, dupes, query, rules, snapshot};
@@ -228,6 +228,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print a shell completion script, e.g. `cleanmcp completions bash > ~/.local/share/bash-completion/completions/cleanmcp`.
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Print the man page (roff) to stdout.
+    #[command(hide = true)]
+    Man,
     /// Run as an MCP server (stdio by default) so AI agents can explore disk usage.
     Mcp {
         /// Only allow access inside this folder. Repeatable. Default: anywhere.
@@ -244,43 +252,58 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config_result = Config::load(cli.config.as_deref());
-    if let Command::Mcp {
-        roots,
-        allow_delete,
-        http,
-    } = cli.command
-    {
-        // stdout carries the MCP protocol, so logs must go to stderr.
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .init();
-        // A broken config must not take the agent's tools down: warn and use defaults.
-        let cfg = config_result.unwrap_or_else(|e| {
-            tracing::warn!("ignoring config file: {e}");
-            Config::default()
-        });
-        let opts = mcp::McpOptions {
+    let config_path = cli.config.clone();
+    // Loaded only by commands that use it, so a broken config cannot block the others.
+    let config =
+        || Config::load(config_path.as_deref()).map_err(|e| anyhow::anyhow!("config error: {e}"));
+    match cli.command {
+        Command::Completions { shell } => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "cleanmcp",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
+        Command::Man => {
+            clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+            Ok(())
+        }
+        Command::Mcp {
             roots,
             allow_delete,
             http,
-        };
-        return tokio::runtime::Runtime::new()?.block_on(mcp::serve(cfg, opts));
-    }
-    if let Command::Drives { all, json } = cli.command {
-        let d = drives::list_drives(all);
-        return if json {
-            output::print_json(&d)
-        } else {
-            output::print_drives(&d);
-            Ok(())
-        };
-    }
-    let cfg = config_result.map_err(|e| anyhow::anyhow!("config error: {e}"))?;
-    match cli.command {
-        Command::Mcp { .. } | Command::Drives { .. } => unreachable!("handled above"),
+        } => {
+            // stdout carries the MCP protocol, so logs must go to stderr.
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .init();
+            // A broken config must not take the agent's tools down: warn and use defaults.
+            let cfg = config().unwrap_or_else(|e| {
+                tracing::warn!("ignoring config file: {e}");
+                Config::default()
+            });
+            let opts = mcp::McpOptions {
+                roots,
+                allow_delete,
+                http,
+            };
+            tokio::runtime::Runtime::new()?.block_on(mcp::serve(cfg, opts))
+        }
+        Command::Drives { all, json } => {
+            let d = drives::list_drives(all);
+            if json {
+                output::print_json(&d)
+            } else {
+                output::print_drives(&d);
+                Ok(())
+            }
+        }
+
         Command::Ui { scan } => {
+            let cfg = config()?;
             let s = scan.run(&cfg)?;
             ui::run(s, scan.mode())
         }
@@ -290,6 +313,7 @@ fn main() -> Result<()> {
             top,
             json,
         } => {
+            let cfg = config()?;
             let s = scan.run(&cfg)?;
             let mode = scan.mode();
             if json {
@@ -308,6 +332,7 @@ fn main() -> Result<()> {
             ext,
             json,
         } => {
+            let cfg = config()?;
             let s = scan.run(&cfg)?;
             let filter = FileFilter {
                 min_size,
@@ -324,6 +349,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Ext { scan, top, json } => {
+            let cfg = config()?;
             let s = scan.run(&cfg)?;
             let stats = query::by_extension(&s.tree, top, scan.mode());
             if json {
@@ -334,6 +360,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Age { scan, json } => {
+            let cfg = config()?;
             let s = scan.run(&cfg)?;
             let stats = query::by_age(&s.tree);
             if json {
@@ -349,6 +376,7 @@ fn main() -> Result<()> {
             top,
             json,
         } => {
+            let cfg = config()?;
             let s = scan.run(&cfg)?;
             let mut groups =
                 dupes::find_duplicates(&s.tree, &s.root, &dupes::DupeOptions { min_size });
@@ -367,6 +395,7 @@ fn main() -> Result<()> {
             min_size,
             json,
         } => {
+            let cfg = config()?;
             let rules = cfg.rule_set().map_err(anyhow::Error::msg)?;
             let s = scan.run(&cfg)?;
             let c = rules::find_candidates(&rules, &s.tree, &s.root, min_size);
@@ -378,6 +407,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Rules { json } => {
+            let cfg = config()?;
             let rules = cfg.rule_set().map_err(anyhow::Error::msg)?;
             if json {
                 output::print_json(rules.rules())
@@ -393,6 +423,7 @@ fn main() -> Result<()> {
             dirs_only,
             min_size,
         } => {
+            let cfg = config()?;
             let s = scan.run(&cfg)?;
             let mut w: Box<dyn Write> = match &out {
                 Some(p) => Box::new(std::io::BufWriter::new(
@@ -414,6 +445,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Snapshot { scan, output: out } => {
+            let cfg = config()?;
             let s = scan.run(&cfg)?;
             snapshot::save(&s, &out).with_context(|| format!("cannot write {}", out.display()))?;
             eprintln!(
@@ -433,6 +465,7 @@ fn main() -> Result<()> {
             quiet,
             json,
         } => {
+            let cfg = config()?;
             let old_scan =
                 snapshot::load(&old).with_context(|| format!("cannot read {}", old.display()))?;
             let new_scan = match new {

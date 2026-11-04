@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Manual runs build and upload artifacts without publishing a release.
+  workflow_dispatch:
+
+# Read-only by default; only the publish job may create the release.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --locked -p cleanmcp --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="dev-${GITHUB_SHA::7}"; fi
+          NAME="cleanmcp-$VERSION-${{ matrix.target }}"
+          EXE=""; [[ "${{ matrix.target }}" == *windows* ]] && EXE=".exe"
+          BIN="target/${{ matrix.target }}/release/cleanmcp$EXE"
+          "$BIN" --version
+          mkdir -p "dist/$NAME/completions"
+          cp "$BIN" README.md LICENSE-MIT LICENSE-APACHE "dist/$NAME/"
+          cp docs/mcp-setup.md "dist/$NAME/MCP-SETUP.md"
+          "$BIN" completions bash > "dist/$NAME/completions/cleanmcp.bash"
+          "$BIN" completions zsh > "dist/$NAME/completions/_cleanmcp"
+          "$BIN" completions fish > "dist/$NAME/completions/cleanmcp.fish"
+          "$BIN" completions powershell > "dist/$NAME/completions/_cleanmcp.ps1"
+          "$BIN" man > "dist/$NAME/cleanmcp.1"
+          cd dist
+          if [[ -n "$EXE" ]]; then 7z a -tzip "$NAME.zip" "$NAME" > /dev/null; else tar -czf "$NAME.tar.gz" "$NAME"; fi
+          rm -rf "$NAME"
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and release notes
+        run: |
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS && cd ..
+          VERSION="${GITHUB_REF_NAME#v}"
+          # The section of CHANGELOG.md whose heading is exactly "## <version> ...".
+          awk -v v="$VERSION" '/^## /{f = ($2 == v); next} f' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then echo "::error::CHANGELOG.md has no section for $VERSION"; exit 1; fi
+          cat notes.md
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "cleanmcp $GITHUB_REF_NAME" --notes-file notes.md

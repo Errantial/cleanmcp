@@ -4,7 +4,26 @@
 
 A TreeSize-style disk usage explorer for the terminal on Windows and Linux, with a built-in [MCP](https://modelcontextprotocol.io) server so AI agents can find out what is filling your disk and suggest what to clean up.
 
-> Early development. See [PLAN.md](PLAN.md) for the roadmap.
+## Install
+
+**Windows** (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/Errantial/cleanmcp/main/install.ps1 | iex
+```
+
+**Linux** (x86_64 / arm64, static binary):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Errantial/cleanmcp/main/install.sh | sh
+```
+
+Scoop: `scoop bucket add cleanmcp https://github.com/Errantial/cleanmcp; scoop install cleanmcp`.
+
+Or download an archive from [Releases](https://github.com/Errantial/cleanmcp/releases), or build from
+source: `cargo install --git https://github.com/Errantial/cleanmcp cleanmcp`.
+
+Shell completions: `cleanmcp completions bash|zsh|fish|powershell` (also included in the archives).
 
 ## Usage
 
@@ -69,4 +88,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-Requires Rust 1.85+.
+Requires Rust 1.85+. Roadmap and design notes: [PLAN.md](PLAN.md). Changes: [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+MIT or Apache-2.0, at your option.
