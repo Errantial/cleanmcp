@@ -356,7 +356,12 @@ pub fn by_extension(root: &Node, n: usize, mode: SizeMode) -> Vec<ExtensionStat>
         }
     });
     let mut out = stats;
-    out.sort_unstable_by_key(|s| Reverse(s.size_by(mode)));
+    // Sorted by size; ties by extension so the output is stable between runs.
+    out.sort_unstable_by(|a, b| {
+        b.size_by(mode)
+            .cmp(&a.size_by(mode))
+            .then_with(|| a.extension.cmp(&b.extension))
+    });
     out.truncate(n);
     out
 }

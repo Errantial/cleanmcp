@@ -239,11 +239,85 @@ pub fn builtin_rules() -> Vec<Rule> {
     BUILTIN.iter().map(Rule::from).collect()
 }
 
+/// A component of a glob, used as a cheap pre-check before running the glob.
+#[derive(Debug)]
+enum Anchor {
+    /// The component must equal this name (already lowercased).
+    Exact(String),
+    /// The component must start with this (already lowercased).
+    Prefix(String),
+}
+
 /// One compiled `path` rule.
 struct PathRule {
     /// Index into [`RuleSet::rules`].
     rule: usize,
     glob: GlobMatcher,
+    /// A component of the glob that must match the path for the glob to have
+    /// any chance: `(depth from the end, anchor)`. Lets a rule skip the regex
+    /// engine for almost every directory.
+    anchor: Option<(usize, Anchor)>,
+}
+
+impl PathRule {
+    fn check(&self, path: &Path) -> bool {
+        match &self.anchor {
+            None => true,
+            Some((depth, anchor)) => {
+                let mut p = path;
+                for _ in 0..*depth {
+                    match p.parent() {
+                        Some(parent) => p = parent,
+                        None => return false,
+                    }
+                }
+                match p.file_name().and_then(|n| n.to_str()) {
+                    Some(component) => match anchor {
+                        Anchor::Exact(name) => component.eq_ignore_ascii_case(name),
+                        Anchor::Prefix(prefix) => {
+                            component.len() >= prefix.len()
+                                && component.is_char_boundary(prefix.len())
+                                && component[..prefix.len()].eq_ignore_ascii_case(prefix)
+                        }
+                    },
+                    None => false,
+                }
+            }
+        }
+    }
+}
+
+/// The strongest cheap check a glob allows: walk its segments from the end and
+/// use the first one that is not a bare wildcard. `None` means "always run the
+/// glob" (nothing literal to check).
+fn glob_anchor(pattern: &str) -> Option<(usize, Anchor)> {
+    let mut depth = 0;
+    for segment in pattern.rsplit('/') {
+        if segment.is_empty() {
+            // Trailing separator or similar: do not assume anything.
+            return None;
+        }
+        // `**` can span any number of components, so no fixed depth is sound.
+        if segment == "**" {
+            return None;
+        }
+        if !segment.contains(['*', '?', '[', '{', ']', '}']) {
+            return Some((depth, Anchor::Exact(segment.to_lowercase())));
+        }
+        // `prefix*` (one trailing star, no other metacharacters).
+        if let Some(prefix) = segment.strip_suffix('*')
+            && !prefix.is_empty()
+            && !prefix.contains(['*', '?', '[', '{', ']', '}'])
+        {
+            return Some((depth, Anchor::Prefix(prefix.to_lowercase())));
+        }
+        // A bare `*` segment: the next component back is one level up.
+        if segment != "*" {
+            return None;
+        }
+        depth += 1;
+    }
+    None
 }
 
 /// Compiled rule set ready for matching.
@@ -258,7 +332,7 @@ pub struct RuleSet {
     by_name: HashMap<String, Vec<usize>>,
     /// `path` rules whose glob ends in a literal segment, by lowercased segment.
     by_suffix: HashMap<String, Vec<PathRule>>,
-    /// `path` rules whose glob ends in a wildcard: checked for every directory.
+    /// `path` rules whose glob ends in a wildcard: pre-checked for every directory.
     any_suffix: Vec<PathRule>,
 }
 
@@ -280,8 +354,19 @@ impl RuleSet {
                     .build()?
                     .compile_matcher();
                 let last = p.rsplit('/').next().unwrap_or("");
-                let path_rule = PathRule { rule: i, glob };
-                if !last.is_empty() && !last.contains(['*', '?', '[', '{', ']', '}']) {
+                let literal_suffix =
+                    !last.is_empty() && !last.contains(['*', '?', '[', '{', ']', '}']);
+                let path_rule = PathRule {
+                    rule: i,
+                    glob,
+                    // The last segment is checked by the bucket it lands in.
+                    anchor: if literal_suffix {
+                        None
+                    } else {
+                        glob_anchor(&p)
+                    },
+                };
+                if literal_suffix {
                     by_suffix
                         .entry(last.to_lowercase())
                         .or_default()
@@ -378,7 +463,10 @@ impl RuleSet {
             if best.is_some_and(|b| pr.rule >= b) {
                 continue;
             }
-            if pr.glob.is_match(path) && self.requirements_ok(pr.rule, dir, has_sibling) {
+            if pr.check(path)
+                && pr.glob.is_match(path)
+                && self.requirements_ok(pr.rule, dir, has_sibling)
+            {
                 best = Some(pr.rule);
             }
         }
@@ -505,6 +593,58 @@ mod tests {
         fs::create_dir_all(p.join("other/target")).unwrap();
         fs::write(p.join("other/target/x"), vec![1u8; 100]).unwrap();
         assert_eq!(rule_ids(p, &RuleSet::builtin()), ["cargo_target"]);
+    }
+
+    #[test]
+    fn wildcard_suffix_rule_still_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        fs::create_dir_all(p.join("home/stuff/renders/sub")).unwrap();
+        fs::write(p.join("home/stuff/renders/sub/x"), vec![1u8; 10]).unwrap();
+        fs::create_dir_all(p.join("home/other/renders2/sub")).unwrap();
+        fs::write(p.join("home/other/renders2/sub/x"), vec![1u8; 10]).unwrap();
+        let rules = RuleSet::new(vec![Rule {
+            id: "render_sub".into(),
+            dir_name: None,
+            path: Some("**/stuff/renders/*".into()),
+            requires_sibling: vec![],
+            requires_child: vec![],
+            safety: Safety::Review,
+            reason: "inside renders".into(),
+            advice: None,
+            os: Os::Any,
+        }])
+        .unwrap();
+        let s = scan(p, &ScanOptions::default()).unwrap();
+        let hits: Vec<String> = find_candidates(&rules, &s.tree, &s.root, 0)
+            .into_iter()
+            .map(|c| {
+                c.entry
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(hits, ["sub"]);
+    }
+
+    #[test]
+    fn glob_anchors_are_conservative() {
+        // A literal component before a `*` may be used as a pre-check...
+        match glob_anchor("**/stuff/renders/*") {
+            Some((1, Anchor::Exact(name))) => assert_eq!(name, "renders"),
+            other => panic!("unexpected anchor {other:?}"),
+        }
+        match glob_anchor("**/Code/Cache*") {
+            Some((0, Anchor::Prefix(prefix))) => assert_eq!(prefix, "cache"),
+            other => panic!("unexpected anchor {other:?}"),
+        }
+        // ...but `**` spans components, so no fixed depth is sound.
+        assert!(glob_anchor("**/foo/**").is_none());
+        assert!(glob_anchor("**/*").is_none());
+        assert!(glob_anchor("**/a[bc]/*").is_none());
     }
 
     #[test]
