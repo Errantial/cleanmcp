@@ -618,6 +618,8 @@ fn help_text(width: usize, height: usize) -> Vec<&'static str> {
         .into_iter()
         .filter(|l| l.chars().count() <= width)
         .collect();
+    // A blank separator is cosmetic; drop it before losing a real hint.
+    lines.retain(|l| !l.is_empty());
     lines.truncate(height);
     lines
 }
