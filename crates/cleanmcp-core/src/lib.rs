@@ -10,6 +10,7 @@
 pub mod config;
 pub mod drives;
 pub mod dupes;
+pub mod jsonwrite;
 mod os;
 pub mod query;
 pub mod rules;
