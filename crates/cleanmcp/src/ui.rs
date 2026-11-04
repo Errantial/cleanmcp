@@ -45,6 +45,18 @@ impl Sort {
     }
 }
 
+/// Case-insensitive name order, equivalent to comparing `to_lowercase()`
+/// strings but without allocating one per comparison for ASCII names.
+fn cmp_name_ci(a: &str, b: &str) -> std::cmp::Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        a.bytes()
+            .map(|c| c.to_ascii_lowercase())
+            .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+    } else {
+        a.to_lowercase().cmp(&b.to_lowercase())
+    }
+}
+
 pub struct App {
     pub scan: Scan,
     /// Child names from the scan root down to the directory being shown.
@@ -121,11 +133,15 @@ impl App {
         let mut v: Vec<usize> = (0..node.children().len()).collect();
         let c = node.children();
         match sort {
-            Sort::Size => v.sort_by_key(|&i| std::cmp::Reverse(c[i].size_by(mode))),
-            Sort::Files => v.sort_by_key(|&i| std::cmp::Reverse(c[i].file_count())),
+            // The scanner keeps children sorted by size on disk, so the default
+            // view needs no sorting at all - even in a folder with 100k entries.
+            Sort::Size if mode == SizeMode::Disk => {}
+            Sort::Size => v.sort_unstable_by_key(|&i| std::cmp::Reverse(c[i].size_by(mode))),
+            Sort::Files => v.sort_unstable_by_key(|&i| std::cmp::Reverse(c[i].file_count())),
             // Unknown times go last, not first.
-            Sort::Age => v.sort_by_key(|&i| (c[i].mtime == NO_TIME, c[i].mtime)),
-            Sort::Name => v.sort_by_cached_key(|&i| c[i].name.to_lowercase()),
+            Sort::Age => v.sort_unstable_by_key(|&i| (c[i].mtime == NO_TIME, c[i].mtime)),
+            // Stable, and without lowercasing every name into a new String.
+            Sort::Name => v.sort_by(|&a, &b| cmp_name_ci(&c[a].name, &c[b].name)),
         }
         self.view = v;
         let len = self.view.len();
@@ -335,7 +351,7 @@ impl App {
                 Style::new().bold(),
             )]),
             Line::from(format!(
-                "{} {mode} · {} files · {} dirs · sorted by {}",
+                "{} {mode} Â· {} files Â· {} dirs Â· sorted by {}",
                 human(total),
                 node.file_count(),
                 node.dir_count(),
@@ -353,7 +369,7 @@ impl App {
                 let size = c.size_by(self.mode);
                 let share = pct(size, total);
                 let filled = ((share / 10.0).round() as usize).min(10);
-                let bar = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
+                let bar = format!("{}{}", "â–ˆ".repeat(filled), "â–‘".repeat(10 - filled));
                 let marked = self.marked.contains(&base.join(c.name.as_str()));
                 let age = c
                     .age()
@@ -369,7 +385,7 @@ impl App {
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(
-                        if marked { "● " } else { "  " },
+                        if marked { "â— " } else { "  " },
                         Style::new().fg(Color::Yellow),
                     ),
                     Span::raw(format!("{:>10} ", human(size))),
@@ -394,7 +410,7 @@ impl App {
             String::new()
         } else {
             format!(
-                "{} marked ({}) · ",
+                "{} marked ({}) Â· ",
                 self.marked.len(),
                 human(self.marked_size())
             )
@@ -402,7 +418,7 @@ impl App {
         let foot = vec![
             Line::from(format!("{marked}{}", self.status)),
             Line::from(
-                "↑↓ move  ⏎/→ open  ←/⌫ up  space mark  d trash  o reveal  s sort  a size mode  ? help  q quit",
+                "â†‘â†“ move  âŽ/â†’ open  â†/âŒ« up  space mark  d trash  o reveal  s sort  a size mode  ? help  q quit",
             )
             .dark_gray(),
         ];
@@ -437,8 +453,8 @@ impl App {
             popup(f, "Confirm", lines);
         } else if self.help {
             let lines = [
-                "↑/↓ j/k        move          PgUp/PgDn, g/G  jump",
-                "Enter/→/l      open folder   ←/Backspace/h   go up",
+                "â†‘/â†“ j/k        move          PgUp/PgDn, g/G  jump",
+                "Enter/â†’/l      open folder   â†/Backspace/h   go up",
                 "space          mark/unmark   u               clear marks",
                 "d / Delete     move marked (or selected) items to the trash",
                 "o              show in Explorer / file manager",
