@@ -509,6 +509,7 @@ mod imp {
             let mut errors = 0;
             // The first call restarts the enumeration; later calls continue it.
             let mut class = FileFullDirectoryRestartInfo;
+            let mut emitted = false;
             loop {
                 // SAFETY: valid directory handle and a buffer of `buf.len()` bytes.
                 let ok = unsafe {
@@ -522,11 +523,18 @@ mod imp {
                 if ok == 0 {
                     let err = io::Error::last_os_error();
                     if err.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+                        // Nothing has been handed to `f` yet, so the caller can
+                        // restart this directory with the std fallback instead of
+                        // losing the subtree to a quirk of the fast path.
+                        if !emitted {
+                            return Err(err);
+                        }
                         errors += 1;
                     }
                     return Ok(errors);
                 }
                 class = FileFullDirectoryInfo;
+                emitted = true;
                 errors += emit_batch(buf, &mut name, &mut scratch, f);
             }
         })

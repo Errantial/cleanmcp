@@ -151,26 +151,25 @@ pub fn hash_candidates(candidates: Vec<(u64, Vec<PathBuf>)>) -> Vec<DuplicateGro
 
     // Pass 2: quick hash. One small buffer per chunk, reused across the files in it.
     let per_chunk = chunk_size(paths.len());
-    let keys: Vec<Option<Hash>> = paths
+    let keys: Vec<Option<(Hash, bool)>> = paths
         .par_chunks(per_chunk)
-        .enumerate()
-        .map(|(ci, chunk)| {
-            let start = ci * per_chunk;
+        .map(|chunk| {
             let mut buf = vec![0u8; 2 * PARTIAL as usize];
             chunk
                 .iter()
-                .enumerate()
-                .map(|(i, p)| quick_key(p, sizes[start + i], &mut buf).ok())
+                .map(|p| quick_key(p, &mut buf).ok())
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>()
         .concat();
 
     let mut groups: Vec<DuplicateGroup> = Vec::new();
-    let mut map: HashMap<(u64, Hash), Vec<u32>> = HashMap::with_capacity(paths.len() / 2);
+    let mut map: HashMap<(u64, Hash), Vec<(u32, bool)>> = HashMap::with_capacity(paths.len() / 2);
     for (i, key) in keys.iter().enumerate() {
-        if let Some(key) = key {
-            map.entry((sizes[i], *key)).or_default().push(i as u32);
+        if let Some((key, whole)) = key {
+            map.entry((sizes[i], *key))
+                .or_default()
+                .push((i as u32, *whole));
         }
     }
     // Groups that still need work: (size, candidate indices).
@@ -179,11 +178,12 @@ pub fn hash_candidates(candidates: Vec<(u64, Vec<PathBuf>)>) -> Vec<DuplicateGro
         if idxs.len() < 2 {
             continue;
         }
-        if size <= SMALL {
-            // The quick key covered the whole file.
+        // Only skip the full pass when every member was hashed in full.
+        if idxs.iter().all(|(_, whole)| *whole) {
+            let idxs: Vec<u32> = idxs.into_iter().map(|(i, _)| i).collect();
             groups.push(make_group(size, key, &paths, &idxs));
         } else {
-            pending.push((size, idxs));
+            pending.push((size, idxs.into_iter().map(|(i, _)| i).collect()));
         }
     }
 
@@ -311,14 +311,19 @@ fn chunk_size(len: usize) -> usize {
 
 /// Quick key of one file: the first and last block, or the whole content for files
 /// small enough for that to cover everything.
-fn quick_key(path: &Path, size: u64, buf: &mut [u8]) -> io::Result<Hash> {
+fn quick_key(path: &Path, buf: &mut [u8]) -> io::Result<(Hash, bool)> {
     let mut f = File::open(path)?;
+    // The size recorded by the scan can be stale (the MCP server caches scans
+    // for a whole session), so ask the file whether a short read is the whole
+    // file. Otherwise a grown file would be reported as a duplicate on the
+    // strength of its first block.
+    let size = f.metadata()?.len();
     let mut h = blake3::Hasher::new();
     if size <= SMALL {
         // At most 2 * PARTIAL bytes is the whole file.
         let n = fill(&mut f, &mut buf[..2 * PARTIAL as usize])?;
         h.update(&buf[..n]);
-        return Ok(h.finalize());
+        return Ok((h.finalize(), true));
     }
     let n = fill(&mut f, &mut buf[..PARTIAL as usize])?;
     h.update(&buf[..n]);
@@ -326,7 +331,7 @@ fn quick_key(path: &Path, size: u64, buf: &mut [u8]) -> io::Result<Hash> {
     f.seek(SeekFrom::End(-(PARTIAL as i64)))?;
     let n = fill(&mut f, &mut buf[..PARTIAL as usize])?;
     h.update(&buf[..n]);
-    Ok(h.finalize())
+    Ok((h.finalize(), false))
 }
 
 fn hash_full(path: &Path, buf: &mut [u8]) -> io::Result<Hash> {
@@ -589,6 +594,22 @@ mod tests {
         assert_eq!(g[0].size, 900_000);
         assert_eq!(g[0].wasted, 900_000);
         assert_eq!(g[1].size, 40_000);
+    }
+
+    #[test]
+    fn grown_file_is_not_a_duplicate_from_a_stale_size() {
+        // The caller passes the size the scan recorded; the files then grew past
+        // SMALL and differ in the tail. Nothing may be grouped without a full hash.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        let mut va = vec![b'x'; 40_000];
+        let vb = va.clone();
+        va[35_000] = b'y';
+        fs::write(&a, &va).unwrap();
+        fs::write(&b, &vb).unwrap();
+        let groups = hash_candidates(vec![(30_000, vec![a, b])]);
+        assert!(groups.is_empty(), "grouped on a stale size: {groups:?}");
     }
 
     #[test]

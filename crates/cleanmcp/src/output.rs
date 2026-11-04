@@ -141,16 +141,16 @@ pub fn print_extensions(stats: &[ExtensionStat], root: &Node, mode: SizeMode) {
     }
 }
 
-pub fn print_candidates(c: &[Candidate]) {
+pub fn print_candidates(c: &[Candidate], mode: SizeMode) {
     if c.is_empty() {
         println!("No cleanup candidates found.");
         return;
     }
-    let total: u64 = c.iter().map(|c| c.entry.disk_size).sum();
+    let total: u64 = c.iter().map(|c| c.entry.size_by(mode)).sum();
     for c in c {
         println!(
             "{:>10}  {:<11}  {}\n            {}",
-            human(c.entry.disk_size),
+            human(c.entry.size_by(mode)),
             format!("{:?}", c.safety).to_lowercase(),
             c.entry.path.display(),
             c.reason
@@ -414,7 +414,8 @@ fn export_rows(
     mut row: impl FnMut(&mut Vec<u8>, &Path, &Node),
 ) -> std::io::Result<()> {
     let mut result = Ok(());
-    s.tree.walk(&s.root, &mut |p, n| {
+    let mut path = s.root.clone();
+    s.tree.walk_into(&mut path, &mut |p, n| {
         if result.is_err() || (o.dirs_only && !n.is_dir()) || n.size_by(o.mode) < o.min_size {
             return;
         }

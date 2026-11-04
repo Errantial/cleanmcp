@@ -118,7 +118,7 @@ fn main() {
     });
     let rules = RuleSet::builtin();
     best("find_candidates", || {
-        let v = rules::find_candidates(&rules, &s.tree, &s.root, 0);
+        let v = rules::find_candidates(&rules, &s.tree, &s.root, 0, cleanmcp_core::SizeMode::Disk);
         assert!(!v.is_empty());
     });
 }

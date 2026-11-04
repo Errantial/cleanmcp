@@ -78,7 +78,20 @@ fn run_scan(path: &std::path::Path, opts: ScanOptions, quiet: bool) -> Result<Sc
     drop(reporter);
     let scan = result.with_context(|| format!("cannot scan {}", path.display()))?;
     output::print_scan_notes(&scan);
+    if root_unreadable(&scan) {
+        anyhow::bail!(
+            "cannot read {}: the folder could not be listed (permission denied?)",
+            path.display()
+        );
+    }
     Ok(scan)
+}
+
+/// A folder that exists but could not be listed at all. Reporting it as "0 B"
+/// with a success exit code would be a lie, and `--json` callers never see the
+/// stderr note.
+fn root_unreadable(scan: &Scan) -> bool {
+    scan.tree.is_dir() && scan.tree.children().is_empty() && scan.tree.errors() > 0
 }
 
 /// Parse sizes like `500MB`, `1.5GiB`, `4096`.
@@ -398,11 +411,11 @@ fn main() -> Result<()> {
             let cfg = config()?;
             let rules = cfg.rule_set().map_err(anyhow::Error::msg)?;
             let s = scan.run(&cfg)?;
-            let c = rules::find_candidates(&rules, &s.tree, &s.root, min_size);
+            let c = rules::find_candidates(&rules, &s.tree, &s.root, min_size, scan.mode());
             if json {
                 output::print_json(&c)
             } else {
-                output::print_candidates(&c);
+                output::print_candidates(&c, scan.mode());
                 Ok(())
             }
         }
@@ -533,5 +546,36 @@ fn main() -> Result<()> {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cleanmcp_core::{Node, NodeKind};
+
+    fn scan_with(tree: Node) -> Scan {
+        Scan {
+            root: "d".into(),
+            tree,
+            scanned_at: 0,
+            elapsed_ms: 0,
+            stats: Default::default(),
+            settings: Default::default(),
+        }
+    }
+
+    #[test]
+    fn unreadable_root_is_detected() {
+        let mut empty = Node::new(NodeKind::Dir, "d".into(), 0, 0, 0);
+        assert!(!root_unreadable(&scan_with(empty.clone())));
+
+        // Listing failed: one error and no children.
+        empty.add_error();
+        assert!(root_unreadable(&scan_with(empty)));
+
+        // A file root is never "unreadable" in this sense.
+        let f = Node::new(NodeKind::File, "f".into(), 1, 1, 0);
+        assert!(!root_unreadable(&scan_with(f)));
     }
 }

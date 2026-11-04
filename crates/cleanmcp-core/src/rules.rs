@@ -11,7 +11,7 @@ use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
 
 use crate::query::{Entry, NAME_BUF, lower_into};
-use crate::tree::Node;
+use crate::tree::{Node, SizeMode};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -301,6 +301,11 @@ fn glob_anchor(pattern: &str) -> Option<(usize, Anchor)> {
             return None;
         }
         if !segment.contains(['*', '?', '[', '{', ']', '}']) {
+            // globset folds case on ASCII only; lowercasing a non-ASCII segment
+            // here would make the pre-check reject paths the glob would match.
+            if !segment.is_ascii() {
+                return None;
+            }
             return Some((depth, Anchor::Exact(segment.to_lowercase())));
         }
         // `prefix*` (one trailing star, no other metacharacters).
@@ -308,6 +313,9 @@ fn glob_anchor(pattern: &str) -> Option<(usize, Anchor)> {
             && !prefix.is_empty()
             && !prefix.contains(['*', '?', '[', '{', ']', '}'])
         {
+            if !prefix.is_ascii() {
+                return None;
+            }
             return Some((depth, Anchor::Prefix(prefix.to_lowercase())));
         }
         // A bare `*` segment: the next component back is one level up.
@@ -513,8 +521,14 @@ pub struct Candidate {
     pub entry: Entry,
 }
 
-/// Find directories matching `rules`, largest (on disk) first. Does not descend into a match.
-pub fn find_candidates(rules: &RuleSet, root: &Node, base: &Path, min_size: u64) -> Vec<Candidate> {
+/// Find directories matching `rules`, largest in `mode` first. Does not descend into a match.
+pub fn find_candidates(
+    rules: &RuleSet,
+    root: &Node,
+    base: &Path,
+    min_size: u64,
+    mode: SizeMode,
+) -> Vec<Candidate> {
     let mut out = Vec::new();
     // The scan root itself can match too (e.g. scanning ~/.npm/_cacache directly).
     let root_match = root
@@ -523,13 +537,20 @@ pub fn find_candidates(rules: &RuleSet, root: &Node, base: &Path, min_size: u64)
         .flatten();
     match root_match {
         Some(r) => {
-            if root.disk_size >= min_size {
+            if root.size_by(mode) >= min_size {
                 out.push(candidate(r, base, root));
             }
         }
-        None => visit(rules, root, &mut base.to_path_buf(), min_size, &mut out),
+        None => visit(
+            rules,
+            root,
+            &mut base.to_path_buf(),
+            min_size,
+            mode,
+            &mut out,
+        ),
     }
-    out.sort_unstable_by_key(|c| std::cmp::Reverse(c.entry.disk_size));
+    out.sort_unstable_by_key(|c| std::cmp::Reverse(c.entry.size_by(mode)));
     out
 }
 
@@ -548,12 +569,16 @@ fn visit(
     node: &Node,
     path: &mut PathBuf,
     min_size: u64,
+    mode: SizeMode,
     out: &mut Vec<Candidate>,
 ) {
     for child in node.children().iter() {
-        // Children are sorted by disk size, so everything after this is smaller too.
-        if child.disk_size < min_size {
-            break;
+        // Children are sorted by disk size: only disk mode may stop early.
+        if child.size_by(mode) < min_size {
+            if mode == SizeMode::Disk {
+                break;
+            }
+            continue;
         }
         if !child.is_dir() {
             continue;
@@ -561,7 +586,7 @@ fn visit(
         path.push(child.name.as_str());
         match rules.matching(node, child, path) {
             Some(rule) => out.push(candidate(rule, path, child)),
-            None => visit(rules, child, path, min_size, out),
+            None => visit(rules, child, path, min_size, mode, out),
         }
         path.pop();
     }
@@ -575,7 +600,7 @@ mod tests {
 
     fn rule_ids(p: &Path, rules: &RuleSet) -> Vec<String> {
         let s = scan(p, &ScanOptions::default()).unwrap();
-        let mut ids: Vec<String> = find_candidates(rules, &s.tree, &s.root, 0)
+        let mut ids: Vec<String> = find_candidates(rules, &s.tree, &s.root, 0, SizeMode::Disk)
             .into_iter()
             .map(|c| c.rule)
             .collect();
@@ -616,7 +641,7 @@ mod tests {
         }])
         .unwrap();
         let s = scan(p, &ScanOptions::default()).unwrap();
-        let hits: Vec<String> = find_candidates(&rules, &s.tree, &s.root, 0)
+        let hits: Vec<String> = find_candidates(&rules, &s.tree, &s.root, 0, SizeMode::Disk)
             .into_iter()
             .map(|c| {
                 c.entry
@@ -645,6 +670,10 @@ mod tests {
         assert!(glob_anchor("**/foo/**").is_none());
         assert!(glob_anchor("**/*").is_none());
         assert!(glob_anchor("**/a[bc]/*").is_none());
+        // A non-ASCII component cannot be pre-checked: globset folds ASCII only,
+        // so lowercasing it would reject a directory the glob matches.
+        assert!(glob_anchor("**/TÉLÉ/*").is_none());
+        assert!(glob_anchor("**/Загрузки/*").is_none());
     }
 
     #[test]

@@ -66,6 +66,8 @@ pub struct App {
     list: ListState,
     /// First visible row.
     offset: usize,
+    /// Rows moved by PageUp/PageDown; set from the drawn body height.
+    page: usize,
     pub sort: Sort,
     pub mode: SizeMode,
     pub marked: BTreeSet<PathBuf>,
@@ -84,6 +86,7 @@ impl App {
             view: Vec::new(),
             list: ListState::default(),
             offset: 0,
+            page: 15,
             sort: Sort::Size,
             mode,
             marked: BTreeSet::new(),
@@ -230,7 +233,7 @@ impl App {
             self.help = false;
             return;
         }
-        let page = 15;
+        let page = self.page as isize;
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
@@ -329,6 +332,8 @@ impl App {
 
         // Build rows only for the visible window: folders can hold 100k+ entries.
         let height = body.height.saturating_sub(2) as usize;
+        self.page = height.max(1);
+        self.page = height.max(1);
         let sel = self.list.selected().unwrap_or(0);
         if sel < self.offset {
             self.offset = sel;
@@ -345,19 +350,22 @@ impl App {
             SizeMode::Disk => "on disk",
             SizeMode::Apparent => "apparent",
         };
+        let mut meta = format!(
+            "{} {mode} · {} files · {} dirs · sorted by {}",
+            human(total),
+            node.file_count(),
+            node.dir_count(),
+            self.sort.label()
+        );
+        if node.errors() > 0 {
+            meta.push_str(&format!(" · {} unreadable", node.errors()));
+        }
         let head = vec![
             Line::from(vec![Span::styled(
                 self.current_path().display().to_string(),
                 Style::new().bold(),
             )]),
-            Line::from(format!(
-                "{} {mode} · {} files · {} dirs · sorted by {}",
-                human(total),
-                node.file_count(),
-                node.dir_count(),
-                self.sort.label()
-            ))
-            .dark_gray(),
+            Line::from(meta).dark_gray(),
         ];
         f.render_widget(Paragraph::new(head), header);
 
@@ -415,12 +423,19 @@ impl App {
                 human(self.marked_size())
             )
         };
+        // Most detailed hint line that fits the terminal; the shortest keeps
+        // "? help" and "q quit" discoverable on narrow windows.
+        let full = "↑↓ move  ⏎/→ open  ←/⌫ up  space mark  d trash  o reveal  s sort  a size mode  ? help  q quit";
+        let mid = "↑↓ move  ⏎/→ open  ←/⌫ up  space mark  u clear  d trash  s sort  ? help  q quit";
+        let short = "↑↓ move  ⏎ open  ⌫ up  space mark  u clear  d trash  ? help  q quit";
+        let width = footer.width as usize;
+        let hints = [full, mid, short]
+            .into_iter()
+            .find(|h| h.chars().count() <= width)
+            .unwrap_or(short);
         let foot = vec![
             Line::from(format!("{marked}{}", self.status)),
-            Line::from(
-                "↑↓ move  ⏎/→ open  ←/⌫ up  space mark  d trash  o reveal  s sort  a size mode  ? help  q quit",
-            )
-            .dark_gray(),
+            Line::from(hints).dark_gray(),
         ];
         f.render_widget(Paragraph::new(foot), footer);
 
@@ -439,14 +454,22 @@ impl App {
                 .bold(),
                 Line::from(""),
             ];
+            let w = f.area().width.saturating_sub(8).min(90);
+            let inner = w.saturating_sub(2) as usize;
+            // Keep header, "... and N more" and the key hint inside the popup.
+            let max_listed = (f.area().height as usize).saturating_sub(8).clamp(1, 8);
+            let shown = targets.len().min(max_listed);
             lines.extend(
                 targets
                     .iter()
-                    .take(8)
-                    .map(|p| Line::from(p.display().to_string())),
+                    .take(shown)
+                    .map(|p| Line::from(elide_left(&p.display().to_string(), inner))),
             );
-            if targets.len() > 8 {
-                lines.push(Line::from(format!("... and {} more", targets.len() - 8)));
+            if targets.len() > shown {
+                lines.push(Line::from(format!(
+                    "... and {} more",
+                    targets.len() - shown
+                )));
             }
             lines.push(Line::from(""));
             lines.push(Line::from("y = yes, any other key = cancel").dark_gray());
@@ -467,6 +490,17 @@ impl App {
             popup(f, "Help", lines.iter().map(|l| Line::from(*l)).collect());
         }
     }
+}
+
+/// Shorten `s` to at most `width` characters, keeping the informative tail.
+fn elide_left(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len <= width || width == 0 {
+        return s.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    let tail: String = s.chars().skip(len - keep).collect();
+    format!("…{tail}")
 }
 
 fn popup(f: &mut Frame, title: &str, lines: Vec<Line>) {
@@ -683,5 +717,70 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(text.contains("to the trash?"));
+    }
+
+    fn render_text(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn hints_fit_a_narrow_terminal() {
+        let (_dir, mut app) = setup();
+        // 93 cells of hints used to clip "? help" and "q quit" at 80 columns.
+        let text = render_text(&mut app, 70, 20);
+        assert!(text.contains("q quit"), "quit hint clipped: {text}");
+        assert!(text.contains("u clear"), "clear hint missing: {text}");
+    }
+
+    #[test]
+    fn page_size_matches_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..60 {
+            fs::write(dir.path().join(format!("f{i:02}")), vec![1u8; 1000 + i]).unwrap();
+        }
+        let s = scan(dir.path(), &ScanOptions::default()).unwrap();
+        let mut app = App::new(s, SizeMode::Apparent);
+        // 12 rows: 2 header + 2 footer + body, so 6 list rows are visible.
+        render_text(&mut app, 100, 12);
+        assert_eq!(app.page, 6);
+        app.handle_key(key(KeyCode::PageDown), &mut |_| vec![], &mut |_| Ok(()));
+        assert_eq!(app.list.selected(), Some(6));
+    }
+
+    #[test]
+    fn confirm_dialog_always_shows_the_key_hint() {
+        let (_dir, mut app) = setup();
+        let base = app.current_path();
+        // Eight deep paths on a narrow, short terminal used to push the hint off.
+        app.confirm = Some(
+            (0..8)
+                .map(|i| {
+                    base.join(format!(
+                        "a-very-long-directory-name-number-{i}/and/more/still-more/node_modules/x"
+                    ))
+                })
+                .collect(),
+        );
+        let text = render_text(&mut app, 60, 20);
+        assert!(
+            text.contains("y = yes"),
+            "confirmation hint clipped: {text}"
+        );
+        assert!(text.contains("to the trash?"));
+    }
+
+    #[test]
+    fn header_reports_unreadable_entries() {
+        let (_dir, mut app) = setup();
+        app.scan.tree.add_error();
+        let text = render_text(&mut app, 100, 20);
+        assert!(text.contains("unreadable"), "missing error count: {text}");
     }
 }

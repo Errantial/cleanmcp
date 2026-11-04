@@ -11,7 +11,7 @@
 //! and the rows are byte-identical to what `serde_json` produced in 0.1.0, so
 //! old snapshots still load and old binaries can read new snapshots.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -94,8 +94,30 @@ fn open_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
 }
 
 /// Write `scan` to `path` (gzip if it ends in `.gz`).
+///
+/// Writes to a sibling temp file and renames it into place, so a failed or
+/// interrupted save cannot destroy the snapshot it was replacing.
 pub fn save(scan: &Scan, path: &Path) -> io::Result<()> {
-    let file = File::create(path)?;
+    let tmp = tmp_path(path);
+    let result = write_to(scan, path, &tmp);
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+        return result;
+    }
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
+/// `home.jsonl.gz` -> `home.jsonl.gz.tmp`.
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
+fn write_to(scan: &Scan, path: &Path, tmp: &Path) -> io::Result<()> {
+    let file = File::create(tmp)?;
     if is_gz(path) {
         save_gz(scan, file)
     } else {
@@ -675,6 +697,24 @@ mod tests {
         for (x, y) in a.children().iter().zip(b.children().iter()) {
             compare(x, y);
         }
+    }
+
+    #[test]
+    fn save_replaces_atomically_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("data");
+        fs::create_dir_all(&p).unwrap();
+        fs::write(p.join("f"), vec![1u8; 100]).unwrap();
+        let s = scan(&p, &ScanOptions::default()).unwrap();
+        let out = dir.path().join("s.jsonl");
+        save(&s, &out).unwrap();
+        let first = fs::read_to_string(&out).unwrap();
+        save(&s, &out).unwrap();
+        assert_eq!(first, fs::read_to_string(&out).unwrap());
+        assert!(
+            !dir.path().join("s.jsonl.tmp").exists(),
+            "temp file left behind"
+        );
     }
 
     #[test]

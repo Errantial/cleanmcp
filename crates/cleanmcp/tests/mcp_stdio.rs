@@ -202,3 +202,96 @@ async fn roots_and_delete() {
 
     client.cancel().await.unwrap();
 }
+
+/// A refresh of a subtree must not be shadowed by an older cached scan of its
+/// parent: drill-down tools have to see the refreshed data.
+#[tokio::test]
+async fn refreshed_subtree_wins_over_cached_parent() {
+    let data = tempfile::tempdir().unwrap();
+    let dir = fixture();
+    let root = dir.path().to_string_lossy().into_owned();
+    let sub = dir.path().join("proj");
+    let sub_s = sub.to_string_lossy().into_owned();
+    let client = start(&[], data.path()).await;
+
+    // Cache the parent scan first.
+    call(&client, "scan_directory", json!({ "path": root }))
+        .await
+        .unwrap();
+    // New file, then the documented way to get fresh data for a subtree.
+    fs::write(sub.join("fresh.txt"), vec![b'z'; 4096]).unwrap();
+    call(
+        &client,
+        "scan_directory",
+        json!({ "path": sub_s, "refresh": true }),
+    )
+    .await
+    .unwrap();
+
+    let kids = call(&client, "list_children", json!({ "path": sub_s }))
+        .await
+        .unwrap();
+    let seen = kids["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["path"].as_str().is_some_and(|p| p.ends_with("fresh.txt")));
+    assert!(seen, "refreshed subtree was shadowed by the parent: {kids}");
+
+    client.cancel().await.unwrap();
+}
+
+/// The summary has to say when totals are partial or truncated.
+#[tokio::test]
+async fn scan_summary_is_self_describing() {
+    let data = tempfile::tempdir().unwrap();
+    let dir = fixture();
+    let root = dir.path().to_string_lossy().into_owned();
+    let client = start(&[], data.path()).await;
+
+    let scan = call(&client, "scan_directory", json!({ "path": root }))
+        .await
+        .unwrap();
+    assert_eq!(scan["one_filesystem"], json!(false));
+    assert_eq!(scan["cancelled"], json!(false));
+    // 33 top-level entries, 15 listed in 	op_children.
+    assert_eq!(scan["other_children_count"], json!(33 - 15));
+    assert!(scan["other_children_disk_size"].as_u64().is_some());
+
+    client.cancel().await.unwrap();
+}
+
+/// Duplicate groups page like the other list tools do.
+#[tokio::test]
+async fn duplicate_groups_page() {
+    let data = tempfile::tempdir().unwrap();
+    let dir = fixture();
+    // ixture has one pair; add a second, larger one so two pages exist.
+    fs::write(dir.path().join("big-a.bin"), vec![7u8; 400_000]).unwrap();
+    fs::write(dir.path().join("big-b.bin"), vec![7u8; 400_000]).unwrap();
+    let root = dir.path().to_string_lossy().into_owned();
+    let client = start(&[], data.path()).await;
+
+    let first = call(
+        &client,
+        "find_duplicates",
+        json!({ "path": root, "min_size_mib": 0, "top": 1 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first["groups"].as_array().unwrap().len(), 1);
+    assert_eq!(first["next_offset"], json!(1));
+
+    let second = call(
+        &client,
+        "find_duplicates",
+        json!({ "path": root, "min_size_mib": 0, "top": 1, "offset": 1 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second["groups"].as_array().unwrap().len(), 1);
+    assert_ne!(second["groups"][0], first["groups"][0]);
+    assert_eq!(second["next_offset"], json!(null));
+
+    client.cancel().await.unwrap();
+}
