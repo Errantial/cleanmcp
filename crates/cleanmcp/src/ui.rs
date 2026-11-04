@@ -862,7 +862,16 @@ mod tests {
 
     #[test]
     fn compact_layout_fits_40x10() {
-        let (_dir, mut app) = setup();
+        // A scan root whose path is wider than the terminal, on both platforms.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("a-folder-name-that-is-long-enough-to-need-eliding");
+        fs::create_dir_all(root.join("big")).unwrap();
+        fs::write(root.join("big/blob"), vec![1u8; 200_000]).unwrap();
+        fs::write(root.join("small.txt"), vec![1u8; 50_000]).unwrap();
+        let s = scan(&root, &ScanOptions::default()).unwrap();
+        let mut app = App::new(s, SizeMode::Apparent);
         let text = render_text(&mut app, 40, 10);
         // The name comes first and the one size/percent column still fits.
         assert!(text.contains("small.txt"), "filename clipped: {text}");
@@ -871,6 +880,7 @@ mod tests {
         assert!(text.contains("q quit"), "quit hint clipped: {text}");
         // The header path is elided from the left, so its tail survives.
         assert!(text.contains('…'), "header path not elided: {text}");
+        assert!(text.contains("need-eliding"), "folder name lost: {text}");
     }
 
     #[test]
