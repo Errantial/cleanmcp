@@ -559,6 +559,7 @@ mod tests {
             root: "d".into(),
             tree,
             scanned_at: 0,
+            started_at: 0,
             elapsed_ms: 0,
             stats: Default::default(),
             settings: Default::default(),

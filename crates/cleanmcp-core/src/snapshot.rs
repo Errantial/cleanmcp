@@ -122,7 +122,11 @@ fn write_to(scan: &Scan, path: &Path, tmp: &Path) -> io::Result<()> {
         save_gz(scan, file)
     } else {
         let mut file = file;
-        write_rows(scan, |chunk| file.write_all(&chunk))
+        write_rows(scan, |chunk| file.write_all(&chunk))?;
+        file.flush()?;
+        // The rename can reach the disk before the data does; without this the
+        // previous good snapshot could be replaced by an empty file on a crash.
+        file.sync_all()
     }
 }
 
@@ -140,7 +144,10 @@ fn save_gz(scan: &Scan, file: File) -> io::Result<()> {
             for chunk in rx {
                 w.write_all(&chunk)?;
             }
-            w.finish()?.flush()
+            let mut out = w.finish()?;
+            out.flush()?;
+            // Same durability rule as the plain path: data before rename.
+            out.get_ref().sync_all()
         });
         let produced = write_rows(scan, |chunk| {
             tx.send(chunk)
@@ -275,6 +282,9 @@ pub fn load_truncated(path: &Path, max_depth: usize) -> io::Result<Scan> {
     let mut root: Option<Node> = None;
     let mut line = Vec::with_capacity(1024);
     let mut prev_depth = 0usize;
+    // A full load can check that every directory still equals its children: a
+    // file cut between rows would otherwise load as a smaller, plausible tree.
+    let verify = max_depth == usize::MAX;
     loop {
         let n = read_until_newline(&mut *reader, &mut line)?;
         if n == 0 {
@@ -294,7 +304,10 @@ pub fn load_truncated(path: &Path, max_depth: usize) -> io::Result<Scan> {
         }
         prev_depth = depth;
         while stack.len() > depth {
-            close(&mut stack, &mut root);
+            close(&mut stack, &mut root, verify)?;
+        }
+        if root.is_some() {
+            return Err(invalid("snapshot has more than one root node"));
         }
         if depth > max_depth {
             continue;
@@ -305,12 +318,13 @@ pub fn load_truncated(path: &Path, max_depth: usize) -> io::Result<Scan> {
         stack.push((node, Vec::new()));
     }
     while !stack.is_empty() {
-        close(&mut stack, &mut root);
+        close(&mut stack, &mut root, verify)?;
     }
     Ok(Scan {
         root: header.root,
         tree: root.ok_or_else(|| invalid("snapshot has no nodes"))?,
         scanned_at: header.scanned_at,
+        started_at: header.scanned_at,
         elapsed_ms: header.elapsed_ms,
         stats: header.stats,
         settings: header.settings,
@@ -318,20 +332,36 @@ pub fn load_truncated(path: &Path, max_depth: usize) -> io::Result<Scan> {
 }
 
 /// Finish a directory: attach its children and fill in the counters.
-fn close(stack: &mut Vec<(Node, Vec<Node>)>, root: &mut Option<Node>) {
+fn close(
+    stack: &mut Vec<(Node, Vec<Node>)>,
+    root: &mut Option<Node>,
+    verify: bool,
+) -> io::Result<()> {
     let (mut node, kids) = stack.pop().expect("non-empty");
+    if !node.is_dir() && !kids.is_empty() {
+        return Err(invalid("snapshot has children under a non-directory"));
+    }
     if node.is_dir() {
-        // Sizes and `errors` are stored per node in the snapshot; only the
-        // counts have to be rolled up.
         let mut files = 0u32;
         let mut dirs = 0u32;
+        // The row stores this node's *own* errors; the tree wants the subtree total.
+        let mut errors = node.errors();
+        let (mut size, mut disk) = (0u64, 0u64);
         for c in &kids {
             files = files.saturating_add(c.file_count());
             dirs = dirs
                 .saturating_add(c.dir_count())
                 .saturating_add(c.is_dir() as u32);
+            errors = errors.saturating_add(c.errors());
+            size += c.size;
+            disk += c.disk_size;
         }
-        node.set_counts(files, dirs, node.errors());
+        if verify && (node.size != size || node.disk_size != disk) {
+            return Err(invalid(
+                "snapshot is truncated or corrupt: a folder does not match its children",
+            ));
+        }
+        node.set_counts(files, dirs, errors);
     }
     let mut kids = kids;
     // Rows are written largest-first, so this is almost always a no-op.
@@ -343,6 +373,7 @@ fn close(stack: &mut Vec<(Node, Vec<Node>)>, root: &mut Option<Node>) {
         Some((_, siblings)) => siblings.push(node),
         None => *root = Some(node),
     }
+    Ok(())
 }
 
 /// One row: `[depth, kind, name, size, disk_size, mtime, errors]`.
@@ -672,7 +703,7 @@ mod tests {
     const V010_SNAPSHOT: &str = concat!(
         r#"{"format":"cleanmcp-snapshot","version":1,"root":"/tmp/old","scanned_at":1700000000,"elapsed_ms":12,"settings":{"one_filesystem":false,"include_virtual":false,"dedupe_hardlinks":false,"exclude":["*.tmp"]},"stats":{"hardlinks_deduped":0,"skipped_mounts":0,"excluded":1,"cancelled":false}}"#,
         "\n",
-        r#"[0,1,"old",7000,4096,1700000000,1]"#,
+        r#"[0,1,"old",7000,4096,1700000000,0]"#,
         "\n",
         r#"[1,1,"a",5000,4096,1700000000,0]"#,
         "\n",
@@ -761,7 +792,7 @@ mod tests {
         // Quotes and backslashes are illegal in Windows file names, so the
         // escape-heavy cases are unix-only; `jsonwrite` and the old-snapshot
         // fixture cover escaping on both platforms.
-        let mut names = vec!["héllo 🚀", "comma,name", "sp ace"];
+        let mut names = vec!["hÃ©llo ðŸš€", "comma,name", "sp ace"];
         if cfg!(unix) {
             names.push("quote\"inside");
             names.push("back\\slash");
@@ -782,6 +813,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn errors_roll_up_from_a_loaded_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("data");
+        fs::create_dir_all(p.join("sub")).unwrap();
+        fs::write(p.join("sub/leaf"), b"x").unwrap();
+        let mut s = scan(&p, &ScanOptions::default()).unwrap();
+        // The file could not be read: the error belongs to the subtree totals.
+        let sub = s
+            .tree
+            .children_mut()
+            .iter_mut()
+            .find(|c| &*c.name == "sub")
+            .unwrap();
+        sub.children_mut()[0].add_error();
+        sub.finish_dir();
+        s.tree.finish_dir();
+        assert_eq!(s.tree.errors(), 1);
+
+        let f = dir.path().join("e.jsonl");
+        save(&s, &f).unwrap();
+        let back = load(&f).unwrap();
+        assert_eq!(back.tree.errors(), 1, "subtree error count lost on load");
+        assert_eq!(back.find(Path::new("sub")).unwrap().errors(), 1);
+    }
+
+    #[test]
+    fn rejects_a_snapshot_cut_between_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("data");
+        fs::create_dir_all(p.join("sub")).unwrap();
+        fs::write(p.join("sub/leaf"), b"xxxxxxxxxx").unwrap();
+        let s = scan(&p, &ScanOptions::default()).unwrap();
+        let full = dir.path().join("full.jsonl");
+        save(&s, &full).unwrap();
+
+        let text = fs::read_to_string(&full).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        // Header plus the root row: the root's recorded size no longer matches.
+        let cut = dir.path().join("cut.jsonl");
+        fs::write(&cut, format!("{}\n{}\n", lines[0], lines[1])).unwrap();
+        assert!(load(&cut).is_err(), "truncated snapshot loaded as valid");
+    }
+
+    #[test]
+    fn rejects_two_roots_and_children_under_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = r#"{"format":"cleanmcp-snapshot","version":1,"root":"/x","scanned_at":0,"elapsed_ms":0}"#;
+        let two = dir.path().join("two.jsonl");
+        fs::write(
+            &two,
+            format!("{header}\n[0,1,\"a\",0,0,0,0]\n[0,1,\"b\",0,0,0,0]\n"),
+        )
+        .unwrap();
+        assert!(load(&two).is_err(), "second root was silently dropped");
+
+        let kids = dir.path().join("kids.jsonl");
+        fs::write(
+            &kids,
+            format!("{header}\n[0,0,\"f\",1,1,0,0]\n[1,0,\"c\",1,1,0,0]\n"),
+        )
+        .unwrap();
+        assert!(load(&kids).is_err(), "file node accepted children");
     }
 
     #[test]
@@ -882,7 +978,11 @@ mod tests {
         fs::create_dir_all(&p).unwrap();
         // `"` is not a legal Windows file name; the unicode name still checks
         // the common path on both platforms.
-        let name = if cfg!(unix) { "quo\"te é" } else { "quo é" };
+        let name = if cfg!(unix) {
+            "quo\"te Ã©"
+        } else {
+            "quo Ã©"
+        };
         fs::write(p.join(name), vec![1u8; 8]).unwrap();
         let s = scan(&p, &ScanOptions::default()).unwrap();
         let node = s.find(Path::new(name)).unwrap();

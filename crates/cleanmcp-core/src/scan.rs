@@ -89,6 +89,7 @@ struct Ctx<'a> {
 /// cannot loop or count the same data twice through a link.
 pub fn scan(root: &Path, opts: &ScanOptions) -> io::Result<Scan> {
     let started = Instant::now();
+    let started_at = unix_now();
     // The root the user named is resolved (like `du -H`); links *inside* it are not followed.
     let root = crate::resolve_path(root)?;
     let meta = fs::symlink_metadata(&root)?;
@@ -118,6 +119,7 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> io::Result<Scan> {
         root,
         tree,
         scanned_at: unix_now(),
+        started_at,
         elapsed_ms: started.elapsed().as_millis() as u64,
         stats: ScanStats {
             hardlinks_deduped: ctx.hardlinks.into_inner(),
@@ -419,14 +421,14 @@ mod tests {
     #[test]
     fn unicode_and_long_names() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("héllo wörld - ünicode.txt"), b"hi").unwrap();
-        fs::write(dir.path().join("🚀 emoji.txt"), b"hey").unwrap();
+        fs::write(dir.path().join("hÃ©llo wÃ¶rld - Ã¼nicode.txt"), b"hi").unwrap();
+        fs::write(dir.path().join("ðŸš€ emoji.txt"), b"hey").unwrap();
         fs::write(dir.path().join("n".repeat(200)), b"x").unwrap();
         let s = scan(dir.path(), &opts()).unwrap();
         assert_eq!(s.tree.file_count(), 3);
         assert_eq!(s.tree.size, 6);
-        assert!(s.find(Path::new("héllo wörld - ünicode.txt")).is_some());
-        assert!(s.find(Path::new("🚀 emoji.txt")).is_some());
+        assert!(s.find(Path::new("hÃ©llo wÃ¶rld - Ã¼nicode.txt")).is_some());
+        assert!(s.find(Path::new("ðŸš€ emoji.txt")).is_some());
         assert!(s.find(Path::new(&"n".repeat(200))).is_some());
     }
 

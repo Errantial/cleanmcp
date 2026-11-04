@@ -400,6 +400,9 @@ pub struct Scan {
     pub tree: Node,
     /// Unix seconds when the scan finished.
     pub scanned_at: i64,
+    /// Unix seconds when the scan started. The MCP cache uses it to tell a
+    /// newer subtree scan from one that merely finished earlier.
+    pub started_at: i64,
     pub elapsed_ms: u64,
     pub stats: ScanStats,
     pub settings: ScanSettings,
