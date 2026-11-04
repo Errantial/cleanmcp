@@ -51,6 +51,10 @@ CLI flags are unchanged.
   depth limit, not only the tail cut by `top`. `list_children` in the MCP server shares this shape,
   so it gains both fields and reports the omitted children at its depth limit too.
 - An explicit `--config` path that does not exist now errors instead of silently using defaults.
+- An invalid `--exclude` glob now says the pattern is invalid instead of "cannot scan <path>",
+  which blamed the folder for a typo.
+- `diff <directory>` now says it needs a snapshot file instead of "cannot read <dir>: access is
+  denied".
 
 ### Build
 - `rust-version` is 1.88 (the code uses let-chains, stabilized there) and CI compiles that version.
