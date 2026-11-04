@@ -1,11 +1,15 @@
 //! Human-readable and JSON output for CLI commands.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use bytesize::ByteSize;
-use cleanmcp_core::query::{Entry, ExtensionStat};
-use cleanmcp_core::rules::Candidate;
+use cleanmcp_core::drives::Drive;
+use cleanmcp_core::dupes::DuplicateGroup;
+use cleanmcp_core::query::{AgeStat, Entry, ExtensionStat, format_time};
+use cleanmcp_core::rules::{Candidate, Rule};
+use cleanmcp_core::snapshot::DiffNode;
 use cleanmcp_core::{Node, NodeKind, Scan, SizeMode};
 use serde::Serialize;
 
@@ -39,7 +43,6 @@ pub fn print_tree(s: &Scan, depth: usize, top: usize, mode: SizeMode) {
         s.tree.dir_count,
         s.elapsed_ms
     );
-    print_scan_notes(s);
     print_children(&s.tree, "", depth, top, mode);
 }
 
@@ -151,6 +154,9 @@ pub fn print_candidates(c: &[Candidate]) {
             c.entry.path.display(),
             c.reason
         );
+        if let Some(a) = &c.advice {
+            println!("            how: {a}");
+        }
     }
     println!(
         "\nTotal: {} in {} locations. Nothing was deleted.",
@@ -204,4 +210,227 @@ impl TreeJson {
             children,
         }
     }
+}
+
+pub fn print_age(stats: &[AgeStat], mode: SizeMode) {
+    let size = |s: &AgeStat| match mode {
+        SizeMode::Disk => s.disk_size,
+        SizeMode::Apparent => s.size,
+    };
+    let total: u64 = stats.iter().map(size).sum();
+    for s in stats.iter().filter(|s| s.file_count > 0) {
+        let bar = "#".repeat((pct(size(s), total) / 4.0).round() as usize);
+        println!(
+            "{:>12}  {:>10} {:>5.1}%  {:>9} files  {bar}",
+            s.bucket,
+            human(size(s)),
+            pct(size(s), total),
+            s.file_count
+        );
+    }
+}
+
+pub fn print_dupes(groups: &[DuplicateGroup], total_groups: usize, total_wasted: u64) {
+    if groups.is_empty() {
+        println!("No duplicate files found.");
+        return;
+    }
+    for g in groups {
+        println!(
+            "{} wasted  ({} copies of {})",
+            human(g.wasted),
+            g.paths.len(),
+            human(g.size)
+        );
+        for p in &g.paths {
+            println!("    {}", p.display());
+        }
+    }
+    println!(
+        "\n{} duplicate groups, {} could be freed by keeping one copy of each.",
+        total_groups,
+        human(total_wasted)
+    );
+}
+
+pub fn print_rules(rules: &[Rule]) {
+    for r in rules {
+        let what = match (&r.dir_name, &r.path) {
+            (Some(n), _) if r.requires_sibling.is_empty() => format!("dir {n}"),
+            (Some(n), _) => format!("dir {n} (next to {})", r.requires_sibling.join("|")),
+            (None, Some(p)) => p.clone(),
+            _ => String::new(),
+        };
+        println!(
+            "{:<22} {:<11} {:<45} {}",
+            r.id,
+            format!("{:?}", r.safety).to_lowercase(),
+            what,
+            r.reason
+        );
+    }
+}
+
+pub fn print_drives(drives: &[Drive]) {
+    println!(
+        "{:<24} {:>10} {:>10} {:>10} {:>6}  FS",
+        "MOUNT", "SIZE", "USED", "FREE", "USE%"
+    );
+    for d in drives {
+        println!(
+            "{:<24} {:>10} {:>10} {:>10} {:>5.1}%  {}{}",
+            d.mount_point.display(),
+            human(d.total),
+            human(d.used),
+            human(d.available),
+            pct(d.used, d.total),
+            d.file_system,
+            if d.removable { " (removable)" } else { "" }
+        );
+    }
+}
+
+fn signed(delta: i64) -> String {
+    let sign = if delta < 0 { "-" } else { "+" };
+    format!("{sign}{}", human(delta.unsigned_abs()))
+}
+
+pub fn print_diff(d: &DiffNode, old_at: i64, new_at: i64) {
+    println!(
+        "{}  {}  ({} -> {}, {} UTC -> {} UTC)",
+        signed(d.delta),
+        d.path.display(),
+        human(d.old_size),
+        human(d.new_size),
+        format_time(old_at),
+        format_time(new_at)
+    );
+    print_diff_children(d, "");
+}
+
+fn print_diff_children(d: &DiffNode, indent: &str) {
+    let n = d.children.len();
+    for (i, c) in d.children.iter().enumerate() {
+        let last = i + 1 == n && d.more == 0;
+        let (branch, next) = if last {
+            ("└─ ", "   ")
+        } else {
+            ("├─ ", "│  ")
+        };
+        let name = c
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or_default();
+        let tag = match c.status {
+            "added" => " (new)",
+            "removed" => " (deleted)",
+            _ => "",
+        };
+        println!(
+            "{indent}{branch}{:>11}  {name}{}{tag}",
+            signed(c.delta),
+            if c.is_dir { "/" } else { "" }
+        );
+        print_diff_children(c, &format!("{indent}{next}"));
+    }
+    if d.more > 0 {
+        println!("{indent}└─ ({} more changed)", d.more);
+    }
+}
+
+pub struct ExportOptions {
+    pub dirs_only: bool,
+    pub min_size: u64,
+    pub mode: SizeMode,
+}
+
+fn export_rows(
+    s: &Scan,
+    o: &ExportOptions,
+    mut f: impl FnMut(&Path, &Node) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut result = Ok(());
+    s.tree.walk(&s.root, &mut |p, n| {
+        if result.is_err() || (o.dirs_only && !n.is_dir()) || n.size_by(o.mode) < o.min_size {
+            return;
+        }
+        result = f(p, n);
+    });
+    result
+}
+
+fn kind_str(k: NodeKind) -> &'static str {
+    match k {
+        NodeKind::File => "file",
+        NodeKind::Dir => "dir",
+        NodeKind::Link => "link",
+        NodeKind::Other => "other",
+    }
+}
+
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+pub fn export_csv(s: &Scan, o: &ExportOptions, w: &mut dyn Write) -> Result<()> {
+    writeln!(
+        w,
+        "path,kind,disk_size,size,file_count,dir_count,modified_utc"
+    )?;
+    export_rows(s, o, |p, n| {
+        writeln!(
+            w,
+            "{},{},{},{},{},{},{}",
+            csv_field(&p.to_string_lossy()),
+            kind_str(n.kind),
+            n.disk_size,
+            n.size,
+            n.file_count,
+            n.dir_count,
+            n.modified()
+                .map(|_| format_time(n.mtime))
+                .unwrap_or_default()
+        )
+    })?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ExportRow {
+    /// Lossy for non-UTF-8 names, so one odd file cannot abort the export.
+    path: String,
+    kind: &'static str,
+    disk_size: u64,
+    size: u64,
+    file_count: u32,
+    dir_count: u32,
+    modified_utc: Option<String>,
+}
+
+pub fn export_json(s: &Scan, o: &ExportOptions, w: &mut dyn Write) -> Result<()> {
+    w.write_all(b"[\n")?;
+    let mut first = true;
+    export_rows(s, o, |p, n| {
+        if !first {
+            w.write_all(b",\n")?;
+        }
+        first = false;
+        let row = ExportRow {
+            path: p.to_string_lossy().into_owned(),
+            kind: kind_str(n.kind),
+            disk_size: n.disk_size,
+            size: n.size,
+            file_count: n.file_count,
+            dir_count: n.dir_count,
+            modified_utc: n.modified().map(|_| format_time(n.mtime)),
+        };
+        serde_json::to_writer(&mut *w, &row).map_err(std::io::Error::other)
+    })?;
+    w.write_all(b"\n]\n")?;
+    Ok(())
 }

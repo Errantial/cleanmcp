@@ -2,14 +2,19 @@
 //!
 //! - [`scan`] walks a directory in parallel and builds an in-memory [`Node`] tree.
 //! - [`query`] answers questions about a tree (largest files, extensions, ...).
-//! - [`rules`] flags directories that are usually safe to clean up.
+//! - [`rules`] flags directories that are usually safe to clean up ([`config`] adds user rules).
+//! - [`dupes`] finds duplicate files, [`snapshot`] saves scans and diffs them, [`drives`] lists volumes.
 //!
 //! Nothing in this crate deletes files.
 
+pub mod config;
+pub mod drives;
+pub mod dupes;
 mod os;
 pub mod query;
 pub mod rules;
 pub mod scan;
+pub mod snapshot;
 pub mod tree;
 
 pub use scan::{ScanControl, ScanOptions, scan};

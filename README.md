@@ -9,11 +9,37 @@ A TreeSize-style disk usage explorer for the terminal on Windows and Linux, with
 ## Usage
 
 ```sh
-cleanmcp tree C:\Users\me -d 2        # size tree, largest first
-cleanmcp files ~ -n 20 --older-than-days 180
-cleanmcp ext ~/Downloads              # usage by file extension
-cleanmcp suggest ~/code               # node_modules, target/, caches...
-cleanmcp tree . --json                # every command supports --json
+cleanmcp drives                        # volumes and free space
+cleanmcp tree C:\Users\me -d 2         # size tree, largest first
+cleanmcp files ~ --min-size 500MB --older-than 180
+cleanmcp ext ~/Downloads               # usage by file type
+cleanmcp age ~                         # usage by last-modified age
+cleanmcp dupes ~/Pictures              # duplicate files
+cleanmcp suggest ~                     # node_modules, target/, caches, temp...
+cleanmcp snapshot ~ -o home.jsonl.gz   # save now...
+cleanmcp diff home.jsonl.gz            # ...see what grew later
+cleanmcp export ~ --format csv -o home.csv
+cleanmcp tree . --json                 # most commands support --json
+```
+
+Sizes are space used on disk by default (`--apparent` for file lengths). Hard links are counted once
+(`--dedupe-hardlinks` on Windows), symlinks/junctions are never followed, and OneDrive online-only
+files count as 0 bytes on disk.
+
+### Custom cleanup rules
+
+`cleanmcp rules` lists the built-in rules. Add your own in `%APPDATA%\cleanmcp\config.toml` (Windows)
+or `~/.config/cleanmcp/config.toml` (Linux):
+
+```toml
+exclude = ["**/.git"]          # always skip while scanning
+disable_rules = ["xdg_cache"]  # turn off built-in rules by id
+
+[[rule]]
+id = "old_renders"
+path = "**/Videos/renders"     # or: dir_name = "renders"
+safety = "review"              # or "regenerable"
+reason = "Rendered video output"
 ```
 
 Nothing is ever deleted. `suggest` lists folders with a reason and a safety level:

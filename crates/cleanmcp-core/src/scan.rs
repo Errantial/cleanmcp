@@ -12,7 +12,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 
 use crate::os::{self, FileId, FsInfo};
-use crate::tree::{NO_TIME, Node, NodeKind, Scan, ScanStats};
+use crate::tree::{NO_TIME, Node, NodeKind, Scan, ScanSettings, ScanStats};
 
 /// Live counters and a cancel switch shared with a running scan.
 #[derive(Debug, Default)]
@@ -46,6 +46,28 @@ pub struct ScanOptions {
     pub exclude: Vec<String>,
     /// Progress counters / cancellation. Keep a clone to watch or cancel the scan.
     pub control: Arc<ScanControl>,
+}
+
+impl ScanOptions {
+    /// Options that repeat a previous scan's settings.
+    pub fn from_settings(s: &ScanSettings) -> Self {
+        ScanOptions {
+            one_filesystem: s.one_filesystem,
+            include_virtual: s.include_virtual,
+            dedupe_hardlinks: s.dedupe_hardlinks,
+            exclude: s.exclude.clone(),
+            control: Default::default(),
+        }
+    }
+
+    pub fn settings(&self) -> ScanSettings {
+        ScanSettings {
+            one_filesystem: self.one_filesystem,
+            include_virtual: self.include_virtual,
+            dedupe_hardlinks: self.dedupe_hardlinks,
+            exclude: self.exclude.clone(),
+        }
+    }
 }
 
 struct Ctx<'a> {
@@ -94,6 +116,7 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> io::Result<Scan> {
             excluded: ctx.excluded.into_inner(),
             cancelled: opts.control.is_cancelled(),
         },
+        settings: opts.settings(),
     })
 }
 

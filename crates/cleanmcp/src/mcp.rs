@@ -5,7 +5,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::Result;
 use cleanmcp_core::query::{self, Entry, ExtensionStat};
@@ -18,9 +17,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::output::TreeJson;
+use cleanmcp_core::config::Config;
 
-pub async fn serve() -> Result<()> {
-    let service = CleanMcp::new().serve(rmcp::transport::stdio()).await?;
+pub async fn serve(cfg: Config) -> Result<()> {
+    let service = CleanMcp::new(cfg)?.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
@@ -28,6 +28,8 @@ pub async fn serve() -> Result<()> {
 #[derive(Clone)]
 pub struct CleanMcp {
     cache: Arc<Mutex<Vec<Arc<Scan>>>>,
+    rules: Arc<rules::RuleSet>,
+    exclude: Arc<Vec<String>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -114,11 +116,13 @@ pub struct SuggestResult {
 
 #[tool_router]
 impl CleanMcp {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(cfg: Config) -> Result<Self> {
+        Ok(Self {
             cache: Default::default(),
+            rules: Arc::new(cfg.rule_set().map_err(anyhow::Error::msg)?),
+            exclude: Arc::new(cfg.exclude),
             tool_router: Self::tool_router(),
-        }
+        })
     }
 
     #[tool(
@@ -181,9 +185,17 @@ impl CleanMcp {
     ) -> Result<Json<FilesResult>, String> {
         let (path, scan) = self.resolve(&p.path).await?;
         let node = find(&scan, &path)?;
-        let min_age = p.older_than_days.map(|d| Duration::from_secs(d * 86_400));
         Ok(Json(FilesResult {
-            files: query::largest_files(node, &path, p.top.unwrap_or(25), min_age, SizeMode::Disk),
+            files: query::largest_files(
+                node,
+                &path,
+                p.top.unwrap_or(25),
+                &query::FileFilter {
+                    older_than_days: p.older_than_days,
+                    ..Default::default()
+                },
+                SizeMode::Disk,
+            ),
         }))
     }
 
@@ -214,7 +226,12 @@ impl CleanMcp {
     ) -> Result<Json<SuggestResult>, String> {
         let (path, scan) = self.resolve(&p.path).await?;
         let node = find(&scan, &path)?;
-        let candidates = rules::find_candidates(node, &path, p.min_mib.unwrap_or(10) * 1024 * 1024);
+        let candidates = rules::find_candidates(
+            &self.rules,
+            node,
+            &path,
+            p.min_mib.unwrap_or(10) * 1024 * 1024,
+        );
         let total_disk_size = candidates.iter().map(|c| c.entry.disk_size).sum();
         Ok(Json(SuggestResult {
             total_disk_size,
@@ -257,12 +274,14 @@ impl CleanMcp {
             }
         }
         let target = abs.clone();
-        let scan = tokio::task::spawn_blocking(move || {
-            cleanmcp_core::scan(&target, &ScanOptions::default())
-        })
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("cannot scan {}: {e}", abs.display()))?;
+        let opts = ScanOptions {
+            exclude: self.exclude.to_vec(),
+            ..Default::default()
+        };
+        let scan = tokio::task::spawn_blocking(move || cleanmcp_core::scan(&target, &opts))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("cannot scan {}: {e}", abs.display()))?;
         let scan = Arc::new(scan);
         let mut cache = self.cache.lock().unwrap();
         // Drop scans this one replaces (same root or nested inside it).

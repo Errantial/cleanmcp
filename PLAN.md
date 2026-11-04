@@ -38,12 +38,13 @@ crates/
 
 The CLI and MCP server both call `cleanmcp-core`, so their answers always match.
 
-## Current state (v0.1 scaffold): working
+## Current state
 
 - `cleanmcp tree [PATH] -d DEPTH -n TOP [--json]`
-- `cleanmcp files [PATH] -n TOP [--older-than-days N] [--json]`
+- `cleanmcp files [PATH] -n TOP [--min-size SIZE] [--older-than DAYS] [--newer-than DAYS] [--ext LIST] [--json]`
 - `cleanmcp ext [PATH] -n TOP [--json]`
-- `cleanmcp suggest [PATH] [--min-mib N] [--json]`
+- `cleanmcp suggest [PATH] [--min-size SIZE] [--json]`
+- `cleanmcp age|dupes|drives|rules|export|snapshot|diff` (Milestone 2)
 - `cleanmcp mcp` with read-only tools: `scan_directory`, `list_children`, `largest_files`, `extension_breakdown`, `find_cleanup_candidates`
 - Unit tests for size roll-up and rule matching; CI on Windows + Linux
 
@@ -60,13 +61,13 @@ The CLI and MCP server both call `cleanmcp-core`, so their answers always match.
 - [x] Benchmarks recorded in `docs/benchmarks.md` (comparison with `dua`/`dust`/`gdu` deferred to the optimization pass)
 
 ### Milestone 2: TreeSize features
-- [ ] `cleanmcp drives`: list volumes with total/free space (Windows `GetDiskFreeSpaceExW`, Linux `statvfs` + `/proc/mounts`)
-- [ ] Filters: `--min-size`, `--older-than`, `--newer-than`, `--ext`
-- [ ] Group by age buckets (TreeSize "age of files" view)
-- [ ] Duplicate finder (size -> partial hash -> full hash, `blake3`)
-- [ ] Export: CSV, JSON; snapshot to disk and `cleanmcp diff old.json new.json` to see what grew
-- [ ] More cleanup rules: Windows (`%TEMP%`, `SoftwareDistribution\Download`, browser caches, `Windows.old`, `$Recycle.Bin`, crash dumps), Linux (`~/.cache`, journal logs, package caches `apt`/`dnf`/`pacman`, old snaps, Docker), developer caches (npm/pnpm/yarn, cargo registry, pip, Gradle, Maven `.m2`, NuGet, Go module cache)
-- [ ] User-defined rules in a config file (`%APPDATA%\cleanmcp\config.toml` / `~/.config/cleanmcp/config.toml`)
+- [x] `cleanmcp drives`: volumes with size/used/free (via `sysinfo`; pseudo filesystems hidden unless `--all`)
+- [x] `files` filters: `--min-size`, `--older-than`, `--newer-than` (days), `--ext`
+- [x] `cleanmcp age`: usage by age bucket (TreeSize "age of files")
+- [x] `cleanmcp dupes`: duplicate finder (size -> head/tail BLAKE3 -> full BLAKE3, parallel)
+- [x] `cleanmcp export` (CSV/JSON), `cleanmcp snapshot` (JSON Lines, `.gz` optional) and `cleanmcp diff OLD [NEW]`
+- [x] ~80 cleanup rules: project build output (Node, Rust, .NET, Gradle, Maven, Python, ...), Windows (Temp, Update cache, Windows.old, Recycle Bin, crash dumps, browser caches), Linux (journal, apt/dnf/pacman, snaps, Docker, Trash, ~/.cache), developer and AI caches (npm, pnpm, yarn, pip, cargo, Go, NuGet, Maven, Gradle, conda, Hugging Face, Ollama). Each has a safety level and, where useful, the proper cleanup command
+- [x] User config (`config.toml`): extra rules, `disable_rules`, default `exclude`; `cleanmcp rules` lists what is active
 
 ### Milestone 3: interactive TUI
 - [ ] `cleanmcp ui [PATH]`: navigable tree with size bars, sort by size/count/age, open in Explorer/file manager

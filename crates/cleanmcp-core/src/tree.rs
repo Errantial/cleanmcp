@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use compact_str::CompactString;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +131,8 @@ impl Node {
 }
 
 /// Counters collected while scanning.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ScanStats {
     /// Extra hard links to an already-counted file (counted as 0 bytes).
     pub hardlinks_deduped: u64,
@@ -142,6 +144,17 @@ pub struct ScanStats {
     pub cancelled: bool,
 }
 
+/// The options a scan was made with, kept so it can be repeated the same way
+/// (e.g. by `diff` when rescanning).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScanSettings {
+    pub one_filesystem: bool,
+    pub include_virtual: bool,
+    pub dedupe_hardlinks: bool,
+    pub exclude: Vec<String>,
+}
+
 /// A scanned tree plus the root path it was scanned from.
 #[derive(Debug, Clone)]
 pub struct Scan {
@@ -151,6 +164,7 @@ pub struct Scan {
     pub scanned_at: i64,
     pub elapsed_ms: u64,
     pub stats: ScanStats,
+    pub settings: ScanSettings,
 }
 
 impl Scan {

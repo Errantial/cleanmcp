@@ -2,17 +2,22 @@ mod mcp;
 mod output;
 mod progress;
 
+use std::io::Write;
 use std::path::PathBuf;
-use std::time::Duration;
 
-use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
-use cleanmcp_core::{Scan, ScanOptions, SizeMode, query, rules};
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use cleanmcp_core::config::Config;
+use cleanmcp_core::query::FileFilter;
+use cleanmcp_core::{Scan, ScanOptions, SizeMode, drives, dupes, query, rules, snapshot};
 
 /// TreeSize-style disk usage explorer with a built-in MCP server for AI agents.
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
+    /// Config file (default: %APPDATA%\cleanmcp\config.toml or ~/.config/cleanmcp/config.toml).
+    #[arg(long, global = true, value_name = "FILE")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -52,23 +57,39 @@ impl ScanArgs {
         }
     }
 
-    fn options(&self) -> ScanOptions {
-        ScanOptions {
+    fn run(&self, cfg: &Config) -> Result<Scan> {
+        let opts = ScanOptions {
             one_filesystem: self.one_filesystem,
             include_virtual: self.include_virtual,
             dedupe_hardlinks: self.dedupe_hardlinks,
-            exclude: self.exclude.clone(),
+            exclude: self.exclude.iter().chain(&cfg.exclude).cloned().collect(),
             ..Default::default()
-        }
+        };
+        run_scan(&self.path, opts, self.quiet)
     }
+}
 
-    fn run(&self) -> Result<Scan> {
-        let opts = self.options();
-        let reporter = (!self.quiet).then(|| progress::Reporter::start(opts.control.clone()));
-        let result = cleanmcp_core::scan(&self.path, &opts);
-        drop(reporter);
-        result.with_context(|| format!("cannot scan {}", self.path.display()))
-    }
+/// Scan with an optional progress line, then print notes (errors, exclusions...) to stderr.
+fn run_scan(path: &std::path::Path, opts: ScanOptions, quiet: bool) -> Result<Scan> {
+    let reporter = (!quiet).then(|| progress::Reporter::start(opts.control.clone()));
+    let result = cleanmcp_core::scan(path, &opts);
+    drop(reporter);
+    let scan = result.with_context(|| format!("cannot scan {}", path.display()))?;
+    output::print_scan_notes(&scan);
+    Ok(scan)
+}
+
+/// Parse sizes like `500MB`, `1.5GiB`, `4096`.
+fn parse_size(s: &str) -> Result<u64, String> {
+    s.parse::<bytesize::ByteSize>()
+        .map(|b| b.as_u64())
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ExportFormat {
+    Csv,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -86,15 +107,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List the largest files under a directory.
+    /// List the largest files, with optional size/age/type filters.
     Files {
         #[command(flatten)]
         scan: ScanArgs,
         #[arg(short = 'n', long, default_value_t = 20)]
         top: usize,
+        /// Only files at least this big, e.g. `100MB`.
+        #[arg(long, value_parser = parse_size, value_name = "SIZE")]
+        min_size: Option<u64>,
         /// Only files not modified for at least this many days.
-        #[arg(long)]
-        older_than_days: Option<u64>,
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<u64>,
+        /// Only files modified less than this many days ago.
+        #[arg(long, value_name = "DAYS")]
+        newer_than: Option<u64>,
+        /// Only these extensions, e.g. `--ext iso,zip`.
+        #[arg(long, value_delimiter = ',')]
+        ext: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -107,13 +137,87 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Break down disk usage by file age (last modified).
+    Age {
+        #[command(flatten)]
+        scan: ScanArgs,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find duplicate files (same content).
+    Dupes {
+        #[command(flatten)]
+        scan: ScanArgs,
+        /// Ignore files smaller than this.
+        #[arg(long, value_parser = parse_size, default_value = "1MiB", value_name = "SIZE")]
+        min_size: u64,
+        /// Groups to show.
+        #[arg(short = 'n', long, default_value_t = 20)]
+        top: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Suggest directories that are usually safe to clean (build output, caches, ...).
     Suggest {
         #[command(flatten)]
         scan: ScanArgs,
-        /// Ignore matches smaller than this many MiB.
-        #[arg(long, default_value_t = 10)]
-        min_mib: u64,
+        /// Ignore matches smaller than this.
+        #[arg(long, value_parser = parse_size, default_value = "10MiB", value_name = "SIZE")]
+        min_size: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the cleanup rules in effect (built-in + config file).
+    Rules {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List drives / mounted volumes with free space.
+    Drives {
+        /// Include pseudo filesystems (tmpfs, squashfs, ...).
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export every file and directory as CSV or JSON.
+    Export {
+        #[command(flatten)]
+        scan: ScanArgs,
+        #[arg(short, long, value_enum, default_value = "csv")]
+        format: ExportFormat,
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Directories only.
+        #[arg(long)]
+        dirs_only: bool,
+        /// Skip entries smaller than this.
+        #[arg(long, value_parser = parse_size, value_name = "SIZE")]
+        min_size: Option<u64>,
+    },
+    /// Save a scan to a file for a later `diff` (`.gz` = compressed).
+    Snapshot {
+        #[command(flatten)]
+        scan: ScanArgs,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Show what grew or shrank between a snapshot and now (or another snapshot).
+    Diff {
+        /// Snapshot written by `cleanmcp snapshot`.
+        old: PathBuf,
+        /// Newer snapshot, or a directory to scan now. Default: rescan the old snapshot's root.
+        new: Option<PathBuf>,
+        #[arg(short, long, default_value_t = 3)]
+        depth: usize,
+        #[arg(short = 'n', long, default_value_t = 10)]
+        top: usize,
+        #[arg(long)]
+        apparent: bool,
+        /// Do not show the progress line when rescanning.
+        #[arg(short, long)]
+        quiet: bool,
         #[arg(long)]
         json: bool,
     },
@@ -123,44 +227,64 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let config_result = Config::load(cli.config.as_deref());
+    if let Command::Mcp = cli.command {
+        // stdout carries the MCP protocol, so logs must go to stderr.
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .init();
+        // A broken config must not take the agent's tools down: warn and use defaults.
+        let cfg = config_result.unwrap_or_else(|e| {
+            tracing::warn!("ignoring config file: {e}");
+            Config::default()
+        });
+        return tokio::runtime::Runtime::new()?.block_on(mcp::serve(cfg));
+    }
+    if let Command::Drives { all, json } = cli.command {
+        let d = drives::list_drives(all);
+        return if json {
+            output::print_json(&d)
+        } else {
+            output::print_drives(&d);
+            Ok(())
+        };
+    }
+    let cfg = config_result.map_err(|e| anyhow::anyhow!("config error: {e}"))?;
     match cli.command {
-        Command::Mcp => {
-            // stdout carries the MCP protocol, so logs must go to stderr.
-            tracing_subscriber::fmt()
-                .with_writer(std::io::stderr)
-                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-                .init();
-            tokio::runtime::Runtime::new()?.block_on(mcp::serve())
-        }
+        Command::Mcp | Command::Drives { .. } => unreachable!("handled above"),
         Command::Tree {
             scan,
             depth,
             top,
             json,
         } => {
-            let s = scan.run()?;
+            let s = scan.run(&cfg)?;
+            let mode = scan.mode();
             if json {
-                output::print_json(&output::TreeJson::build(
-                    &s.tree,
-                    &s.root,
-                    depth,
-                    top,
-                    scan.mode(),
-                ))
+                output::print_json(&output::TreeJson::build(&s.tree, &s.root, depth, top, mode))
             } else {
-                output::print_tree(&s, depth, top, scan.mode());
+                output::print_tree(&s, depth, top, mode);
                 Ok(())
             }
         }
         Command::Files {
             scan,
             top,
-            older_than_days,
+            min_size,
+            older_than,
+            newer_than,
+            ext,
             json,
         } => {
-            let s = scan.run()?;
-            let min_age = older_than_days.map(|d| Duration::from_secs(d * 86_400));
-            let files = query::largest_files(&s.tree, &s.root, top, min_age, scan.mode());
+            let s = scan.run(&cfg)?;
+            let filter = FileFilter {
+                min_size,
+                older_than_days: older_than,
+                newer_than_days: newer_than,
+                extensions: ext,
+            };
+            let files = query::largest_files(&s.tree, &s.root, top, &filter, scan.mode());
             if json {
                 output::print_json(&files)
             } else {
@@ -169,7 +293,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Ext { scan, top, json } => {
-            let s = scan.run()?;
+            let s = scan.run(&cfg)?;
             let stats = query::by_extension(&s.tree, top, scan.mode());
             if json {
                 output::print_json(&stats)
@@ -178,17 +302,155 @@ fn main() -> Result<()> {
                 Ok(())
             }
         }
-        Command::Suggest {
+        Command::Age { scan, json } => {
+            let s = scan.run(&cfg)?;
+            let stats = query::by_age(&s.tree);
+            if json {
+                output::print_json(&stats)
+            } else {
+                output::print_age(&stats, scan.mode());
+                Ok(())
+            }
+        }
+        Command::Dupes {
             scan,
-            min_mib,
+            min_size,
+            top,
             json,
         } => {
-            let s = scan.run()?;
-            let c = rules::find_candidates(&s.tree, &s.root, min_mib * 1024 * 1024);
+            let s = scan.run(&cfg)?;
+            let mut groups =
+                dupes::find_duplicates(&s.tree, &s.root, &dupes::DupeOptions { min_size });
+            let total_wasted: u64 = groups.iter().map(|g| g.wasted).sum();
+            let total_groups = groups.len();
+            groups.truncate(top);
+            if json {
+                output::print_json(&groups)
+            } else {
+                output::print_dupes(&groups, total_groups, total_wasted);
+                Ok(())
+            }
+        }
+        Command::Suggest {
+            scan,
+            min_size,
+            json,
+        } => {
+            let rules = cfg.rule_set().map_err(anyhow::Error::msg)?;
+            let s = scan.run(&cfg)?;
+            let c = rules::find_candidates(&rules, &s.tree, &s.root, min_size);
             if json {
                 output::print_json(&c)
             } else {
                 output::print_candidates(&c);
+                Ok(())
+            }
+        }
+        Command::Rules { json } => {
+            let rules = cfg.rule_set().map_err(anyhow::Error::msg)?;
+            if json {
+                output::print_json(rules.rules())
+            } else {
+                output::print_rules(rules.rules());
+                Ok(())
+            }
+        }
+        Command::Export {
+            scan,
+            format,
+            output: out,
+            dirs_only,
+            min_size,
+        } => {
+            let s = scan.run(&cfg)?;
+            let mut w: Box<dyn Write> = match &out {
+                Some(p) => Box::new(std::io::BufWriter::new(
+                    std::fs::File::create(p)
+                        .with_context(|| format!("cannot create {}", p.display()))?,
+                )),
+                None => Box::new(std::io::BufWriter::new(std::io::stdout().lock())),
+            };
+            let rows = output::ExportOptions {
+                dirs_only,
+                min_size: min_size.unwrap_or(0),
+                mode: scan.mode(),
+            };
+            match format {
+                ExportFormat::Csv => output::export_csv(&s, &rows, &mut w)?,
+                ExportFormat::Json => output::export_json(&s, &rows, &mut w)?,
+            }
+            w.flush()?;
+            Ok(())
+        }
+        Command::Snapshot { scan, output: out } => {
+            let s = scan.run(&cfg)?;
+            snapshot::save(&s, &out).with_context(|| format!("cannot write {}", out.display()))?;
+            eprintln!(
+                "Saved {} entries ({} on disk) to {}",
+                s.tree.file_count as u64 + s.tree.dir_count as u64,
+                output::human(s.tree.disk_size),
+                out.display()
+            );
+            Ok(())
+        }
+        Command::Diff {
+            old,
+            new,
+            depth,
+            top,
+            apparent,
+            quiet,
+            json,
+        } => {
+            let old_scan =
+                snapshot::load(&old).with_context(|| format!("cannot read {}", old.display()))?;
+            let new_scan = match new {
+                Some(p) if p.is_file() => {
+                    snapshot::load(&p).with_context(|| format!("cannot read {}", p.display()))?
+                }
+                other => {
+                    let path = other.unwrap_or_else(|| old_scan.root.clone());
+                    if !path.is_dir() {
+                        bail!("{} is not a snapshot file or directory", path.display());
+                    }
+                    let mut opts = ScanOptions::from_settings(&old_scan.settings);
+                    for e in &cfg.exclude {
+                        if !opts.exclude.contains(e) {
+                            opts.exclude.push(e.clone());
+                        }
+                    }
+                    run_scan(&path, opts, quiet)?
+                }
+            };
+            if old_scan.root != new_scan.root {
+                eprintln!(
+                    "warning: comparing different folders ({} vs {}); the result shows how they differ, not what changed",
+                    old_scan.root.display(),
+                    new_scan.root.display()
+                );
+            }
+            if old_scan.settings != new_scan.settings {
+                eprintln!(
+                    "warning: the two scans used different options (exclude, --one-filesystem, ...)"
+                );
+            }
+            let mode = if apparent {
+                SizeMode::Apparent
+            } else {
+                SizeMode::Disk
+            };
+            let d = snapshot::diff(
+                &old_scan.tree,
+                &new_scan.tree,
+                &new_scan.root,
+                depth,
+                top,
+                mode,
+            );
+            if json {
+                output::print_json(&d)
+            } else {
+                output::print_diff(&d, old_scan.scanned_at, new_scan.scanned_at);
                 Ok(())
             }
         }
