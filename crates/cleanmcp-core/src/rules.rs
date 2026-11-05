@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobMatcher};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::query::{Entry, NAME_BUF, lower_into};
@@ -541,14 +542,7 @@ pub fn find_candidates(
                 out.push(candidate(r, base, root));
             }
         }
-        None => visit(
-            rules,
-            root,
-            &mut base.to_path_buf(),
-            min_size,
-            mode,
-            &mut out,
-        ),
+        None => out.extend(visit(rules, root, base, min_size, mode)),
     }
     out.sort_unstable_by_key(|c| std::cmp::Reverse(c.entry.size_by(mode)));
     out
@@ -564,7 +558,64 @@ fn candidate(r: &Rule, path: &Path, n: &Node) -> Candidate {
     }
 }
 
+/// Parallel walk: each branch collects its own candidates and the vectors are
+/// merged up the tree, so a big tree no longer walks on one thread. Below
+/// [`PAR_DEPTH`] the walk is serial and reuses one path buffer.
 fn visit(
+    rules: &RuleSet,
+    node: &Node,
+    path: &Path,
+    min_size: u64,
+    mode: SizeMode,
+) -> Vec<Candidate> {
+    visit_at(rules, node, path, min_size, mode, 0)
+}
+
+fn visit_at(
+    rules: &RuleSet,
+    node: &Node,
+    path: &Path,
+    min_size: u64,
+    mode: SizeMode,
+    depth: usize,
+) -> Vec<Candidate> {
+    if depth >= crate::query::PAR_DEPTH {
+        let mut out = Vec::new();
+        let mut p = path.to_path_buf();
+        visit_serial(rules, node, &mut p, min_size, mode, &mut out);
+        return out;
+    }
+    let children = node.children();
+    // Children are sorted by disk size, so in disk mode the children that can
+    // still match are a prefix and the walk stops there; apparent mode has to
+    // check every child because the sort order is by disk size.
+    let limit = if mode == SizeMode::Disk {
+        children.partition_point(|c| c.disk_size >= min_size)
+    } else {
+        children.len()
+    };
+    children[..limit]
+        .par_iter()
+        .filter(|c| c.size_by(mode) >= min_size)
+        .map(|child| {
+            if !child.is_dir() {
+                return Vec::new();
+            }
+            let mut p = path.to_path_buf();
+            p.push(child.name.as_str());
+            match rules.matching(node, child, &p) {
+                Some(rule) => vec![candidate(rule, &p, child)],
+                None => visit_at(rules, child, &p, min_size, mode, depth + 1),
+            }
+        })
+        .reduce(Vec::new, |mut a, mut b| {
+            a.append(&mut b);
+            a
+        })
+}
+
+/// Serial walk below the parallel cutoff, reusing one path buffer.
+fn visit_serial(
     rules: &RuleSet,
     node: &Node,
     path: &mut PathBuf,
@@ -586,7 +637,7 @@ fn visit(
         path.push(child.name.as_str());
         match rules.matching(node, child, path) {
             Some(rule) => out.push(candidate(rule, path, child)),
-            None => visit(rules, child, path, min_size, mode, out),
+            None => visit_serial(rules, child, path, min_size, mode, out),
         }
         path.pop();
     }
@@ -606,6 +657,47 @@ mod tests {
             .collect();
         ids.sort();
         ids
+    }
+
+    #[test]
+    fn min_size_filters_in_both_size_modes() {
+        // Children are sorted by disk size, so disk mode can stop at a prefix;
+        // apparent mode must check every child. Both must agree with a full scan.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        fs::create_dir_all(p.join("a/node_modules")).unwrap();
+        fs::write(p.join("a/package.json"), "").unwrap();
+        fs::write(p.join("a/node_modules/big"), vec![1u8; 100_000]).unwrap();
+        fs::create_dir_all(p.join("b/node_modules")).unwrap();
+        fs::write(p.join("b/package.json"), "").unwrap();
+        fs::write(p.join("b/node_modules/small"), vec![1u8; 100]).unwrap();
+        let rules = RuleSet::builtin();
+        let s = scan(p, &ScanOptions::default()).unwrap();
+
+        let disk = find_candidates(&rules, &s.tree, &s.root, 50_000, SizeMode::Disk);
+        assert_eq!(disk.len(), 1);
+        assert!(
+            disk[0]
+                .entry
+                .path
+                .ends_with(Path::new("a").join("node_modules"))
+        );
+
+        // Apparent mode: the same filter on logical sizes finds the same one.
+        let app = find_candidates(&rules, &s.tree, &s.root, 50_000, SizeMode::Apparent);
+        assert_eq!(app.len(), 1);
+        assert!(
+            app[0]
+                .entry
+                .path
+                .ends_with(Path::new("a").join("node_modules"))
+        );
+
+        // A filter above everything finds nothing in either mode.
+        assert!(find_candidates(&rules, &s.tree, &s.root, 1_000_000, SizeMode::Disk).is_empty());
+        assert!(
+            find_candidates(&rules, &s.tree, &s.root, 1_000_000, SizeMode::Apparent).is_empty()
+        );
     }
 
     #[test]

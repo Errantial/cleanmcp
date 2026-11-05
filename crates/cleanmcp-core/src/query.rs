@@ -7,8 +7,6 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
@@ -215,15 +213,57 @@ pub(crate) fn lower_into<'b>(s: &str, buf: &'b mut [u8; NAME_BUF]) -> Option<&'b
     std::str::from_utf8(out).ok()
 }
 
-/// Visit every file node, without building paths.
-/// Parallel file walk: `f` may run on several threads at
-/// once, so it must be `Sync` and accumulate through atomics or a lock.
-fn visit_files_par(node: &Node, f: &(impl Fn(&Node) + Sync)) {
+/// Serially add every file node below `node` to `acc`.
+fn accum_files<T>(node: &Node, acc: &mut T, f: &impl Fn(&mut T, &Node)) {
     if node.kind() == NodeKind::File {
-        f(node);
+        f(acc, node);
         return;
     }
-    node.children().par_iter().for_each(|c| visit_files_par(c, f));
+    for c in node.children() {
+        accum_files(c, acc, f);
+    }
+}
+
+/// How deep the parallel walks recurse in parallel before switching to a serial
+/// per-chunk walk. Below this depth each chunk walks its subtree into one
+/// accumulator, so the number of partial results (and merges) stays small while
+/// the walk still spreads over every thread.
+pub(crate) const PAR_DEPTH: usize = 4;
+
+/// Parallel map-reduce over every file node: `f` sees file nodes only and
+/// accumulates into a per-chunk `T` (no locks or atomics), and the partial
+/// results are merged pairwise up the tree with `merge`.
+pub(crate) fn fold_files_par<T, I, F, M>(node: &Node, init: &I, f: &F, merge: &M) -> T
+where
+    T: Send,
+    I: Fn() -> T + Sync,
+    F: Fn(&mut T, &Node) + Sync,
+    M: Fn(T, T) -> T + Sync,
+{
+    fold_files_at(node, 0, init, f, merge)
+}
+
+fn fold_files_at<T, I, F, M>(node: &Node, depth: usize, init: &I, f: &F, merge: &M) -> T
+where
+    T: Send,
+    I: Fn() -> T + Sync,
+    F: Fn(&mut T, &Node) + Sync,
+    M: Fn(T, T) -> T + Sync,
+{
+    if node.kind() == NodeKind::File {
+        let mut acc = init();
+        f(&mut acc, node);
+        return acc;
+    }
+    if depth >= PAR_DEPTH {
+        let mut acc = init();
+        accum_files(node, &mut acc, f);
+        return acc;
+    }
+    node.children()
+        .par_iter()
+        .map(|c| fold_files_at(c, depth + 1, init, f, merge))
+        .reduce(init, merge)
 }
 
 /// The `n` largest files anywhere below `base` that pass `filter`.
@@ -238,30 +278,86 @@ pub fn largest_files(
         return Vec::new();
     }
     let matcher = Matcher::new(filter);
-    let mut top = TopN::new(n);
-    let mut path = base.to_path_buf();
-    collect_largest(root, &mut path, &matcher, mode, &mut top);
+    let top = collect_largest_par(root, base, &matcher, mode, n);
     top.into_entries(mode)
 }
 
-fn collect_largest<'a>(
+/// Parallel top-n walk: each branch keeps its own bounded heap and the partial
+/// heaps are merged up the tree, so a big tree no longer walks on one thread.
+/// Below [`PAR_DEPTH`] the walk is serial and reuses one path buffer.
+fn collect_largest_par<'a>(
+    node: &'a Node,
+    path: &Path,
+    matcher: &Matcher<'_>,
+    mode: SizeMode,
+    cap: usize,
+) -> TopN<'a> {
+    collect_largest_at(node, path, matcher, mode, cap, 0)
+}
+
+fn collect_largest_at<'a>(
+    node: &'a Node,
+    path: &Path,
+    matcher: &Matcher<'_>,
+    mode: SizeMode,
+    cap: usize,
+    depth: usize,
+) -> TopN<'a> {
+    if depth >= PAR_DEPTH {
+        let mut top = TopN::new(cap, mode);
+        let mut p = path.to_path_buf();
+        collect_largest_serial(node, &mut p, matcher, mode, &mut top);
+        return top;
+    }
+    node.children()
+        .par_iter()
+        .fold(
+            || TopN::new(cap, mode),
+            |mut top, c| {
+                match c.kind() {
+                    // Files are the only matches, so they never need a path of their own.
+                    NodeKind::File => {
+                        if matcher.matches(c, mode) {
+                            top.offer(path, c);
+                        }
+                    }
+                    _ => {
+                        let mut p = path.to_path_buf();
+                        p.push(c.name.as_str());
+                        let sub = collect_largest_at(c, &p, matcher, mode, cap, depth + 1);
+                        top.merge(sub);
+                    }
+                }
+                top
+            },
+        )
+        .reduce(
+            || TopN::new(cap, mode),
+            |mut a, b| {
+                a.merge(b);
+                a
+            },
+        )
+}
+
+/// Serial top-n walk below the parallel cutoff, reusing one path buffer.
+fn collect_largest_serial<'a>(
     node: &'a Node,
     path: &mut PathBuf,
     matcher: &Matcher<'_>,
     mode: SizeMode,
     top: &mut TopN<'a>,
 ) {
-    for c in node.children().iter() {
+    for c in node.children() {
         match c.kind() {
-            // Files are the only matches, so they never need a path of their own.
             NodeKind::File => {
                 if matcher.matches(c, mode) {
-                    top.offer(path, c, mode);
+                    top.offer(path, c);
                 }
             }
             _ => {
                 path.push(c.name.as_str());
-                collect_largest(c, path, matcher, mode, top);
+                collect_largest_serial(c, path, matcher, mode, top);
                 path.pop();
             }
         }
@@ -273,19 +369,21 @@ struct TopN<'a> {
     slots: Vec<(PathBuf, &'a Node)>,
     heap: BinaryHeap<Reverse<(u64, usize)>>,
     cap: usize,
+    mode: SizeMode,
 }
 
 impl<'a> TopN<'a> {
-    fn new(cap: usize) -> Self {
+    fn new(cap: usize, mode: SizeMode) -> Self {
         TopN {
             slots: Vec::with_capacity(cap),
             heap: BinaryHeap::with_capacity(cap),
             cap,
+            mode,
         }
     }
 
-    fn offer(&mut self, parent: &Path, node: &'a Node, mode: SizeMode) {
-        let size = node.size_by(mode);
+    fn offer(&mut self, parent: &Path, node: &'a Node) {
+        let size = node.size_by(self.mode);
         if self.slots.len() < self.cap {
             self.heap.push(Reverse((size, self.slots.len())));
             self.slots.push((parent.join(node.name.as_str()), node));
@@ -295,6 +393,23 @@ impl<'a> TopN<'a> {
             self.heap.pop();
             self.slots[idx] = (parent.join(node.name.as_str()), node);
             self.heap.push(Reverse((size, idx)));
+        }
+    }
+
+    /// Fold `other`'s slots into `self`, keeping only the `cap` largest.
+    fn merge(&mut self, other: TopN<'a>) {
+        for (p, n) in other.slots {
+            let size = n.size_by(self.mode);
+            if self.slots.len() < self.cap {
+                self.heap.push(Reverse((size, self.slots.len())));
+                self.slots.push((p, n));
+            } else if let Some(&Reverse((min, idx))) = self.heap.peek()
+                && size > min
+            {
+                self.heap.pop();
+                self.slots[idx] = (p, n);
+                self.heap.push(Reverse((size, idx)));
+            }
         }
     }
 
@@ -327,41 +442,70 @@ impl ExtensionStat {
     }
 }
 
-/// Total size per file extension, largest first.
-pub fn by_extension(root: &Node, n: usize, mode: SizeMode) -> Vec<ExtensionStat> {
-    // The walk is parallel, so the table lives behind one lock; the number of
-    // distinct extensions is small, so contention stays low.
-    let table = Mutex::new((Vec::<ExtensionStat>::new(), HashMap::<String, usize>::new()));
-    visit_files_par(root, &|node| {
-        let name = node.name.as_str();
-        let mut buf = [0u8; EXT_BUF];
-        let ext = match lower_ext(name, &mut buf) {
-            Some(ext) => ext.to_owned(),
-            None => extension(name),
-        };
-        let mut t = table.lock().unwrap();
-        let (stats, index) = &mut *t;
-        // Extension -> index into `stats`. Looked up with a borrowed &str so the
-        // common case (an extension we have already seen) allocates nothing.
-        match index.get(ext.as_str()) {
+/// One extension table: the stats plus extension -> index, so a repeat
+/// extension is found with a borrowed `&str` and allocates nothing.
+type ExtTable = (Vec<ExtensionStat>, HashMap<String, usize>);
+
+fn add_ext(table: &mut ExtTable, ext: &str, node: &Node) {
+    let (stats, index) = table;
+    match index.get(ext) {
+        Some(&i) => {
+            let s = &mut stats[i];
+            s.disk_size += node.disk_size;
+            s.size += node.size;
+            s.file_count += 1;
+        }
+        None => {
+            index.insert(ext.to_owned(), stats.len());
+            stats.push(ExtensionStat {
+                extension: ext.to_owned(),
+                disk_size: node.disk_size,
+                size: node.size,
+                file_count: 1,
+            });
+        }
+    }
+}
+
+fn merge_ext_tables(mut a: ExtTable, b: ExtTable) -> ExtTable {
+    for s in b.0 {
+        match a.1.get(&s.extension) {
             Some(&i) => {
-                let s = &mut stats[i];
-                s.disk_size += node.disk_size;
-                s.size += node.size;
-                s.file_count += 1;
+                let d = &mut a.0[i];
+                d.disk_size += s.disk_size;
+                d.size += s.size;
+                d.file_count += s.file_count;
             }
             None => {
-                index.insert(ext.clone(), stats.len());
-                stats.push(ExtensionStat {
-                    extension: ext,
-                    disk_size: node.disk_size,
-                    size: node.size,
-                    file_count: 1,
-                });
+                a.1.insert(s.extension.clone(), a.0.len());
+                a.0.push(s);
             }
         }
-    });
-    let mut out = table.into_inner().unwrap().0;
+    }
+    a
+}
+
+/// Total size per file extension, largest first.
+pub fn by_extension(root: &Node, n: usize, mode: SizeMode) -> Vec<ExtensionStat> {
+    // The walk is parallel; each chunk accumulates its own table (no lock) and
+    // the tables are merged up the tree. Extensions are few, so merging is cheap.
+    let (mut out, _) = fold_files_par(
+        root,
+        &ExtTable::default,
+        &|table: &mut ExtTable, node| {
+            let name = node.name.as_str();
+            let mut buf = [0u8; EXT_BUF];
+            match lower_ext(name, &mut buf) {
+                Some(ext) => add_ext(table, ext, node),
+                // Long or non-ASCII extension: rare, fall back to allocating.
+                None => {
+                    let ext = extension(name);
+                    add_ext(table, &ext, node);
+                }
+            }
+        },
+        &merge_ext_tables,
+    );
     // Sorted by size; ties by extension so the output is stable between runs.
     out.sort_unstable_by(|a, b| {
         b.size_by(mode)
@@ -392,38 +536,51 @@ pub struct AgeStat {
     pub file_count: u64,
 }
 
+/// Per-bucket totals: `(disk, apparent, count)` for each bucket plus "unknown".
+type AgeTable = Vec<(u64, u64, u64)>;
+
 /// How much data was last modified in each age bucket (TreeSize's "age of files").
 pub fn by_age(root: &Node) -> Vec<AgeStat> {
-    // One atomic triple per bucket: the walk is parallel, and there are only
-    // eight buckets, so this stays cheap and lock-free.
-    let stats: Vec<(String, AtomicU64, AtomicU64, AtomicU64)> = AGE_BUCKETS
+    // The walk is parallel; each chunk accumulates its own bucket totals (no
+    // atomics) and the tables are merged up the tree. There are only nine
+    // buckets, so merging is trivial.
+    let now = unix_now();
+    let table = fold_files_par(
+        root,
+        &|| vec![(0, 0, 0); AGE_BUCKETS.len() + 1],
+        &|t: &mut AgeTable, node| {
+            let idx = match node_age_days(node, now) {
+                Some(days) => AGE_BUCKETS
+                    .iter()
+                    .position(|(_, max)| days < *max)
+                    .unwrap_or(AGE_BUCKETS.len() - 1),
+                // No timestamp, or modified in the future.
+                None => AGE_BUCKETS.len(),
+            };
+            let (disk, size, count) = &mut t[idx];
+            *disk += node.disk_size;
+            *size += node.size;
+            *count += 1;
+        },
+        &|mut a: AgeTable, b: AgeTable| {
+            for (x, y) in a.iter_mut().zip(b) {
+                x.0 += y.0;
+                x.1 += y.1;
+                x.2 += y.2;
+            }
+            a
+        },
+    );
+    AGE_BUCKETS
         .iter()
         .map(|(l, _)| *l)
         .chain(std::iter::once("unknown"))
-        .map(|bucket| (bucket.into(), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)))
-        .collect();
-    let now = unix_now();
-    visit_files_par(root, &|node| {
-        let idx = match node_age_days(node, now) {
-            Some(days) => AGE_BUCKETS
-                .iter()
-                .position(|(_, max)| days < *max)
-                .unwrap_or(AGE_BUCKETS.len() - 1),
-            // No timestamp, or modified in the future.
-            None => AGE_BUCKETS.len(),
-        };
-        let (_, disk, size, count) = &stats[idx];
-        disk.fetch_add(node.disk_size, std::sync::atomic::Ordering::Relaxed);
-        size.fetch_add(node.size, std::sync::atomic::Ordering::Relaxed);
-        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    });
-    stats
-        .into_iter()
-        .map(|(bucket, disk, size, count)| AgeStat {
-            bucket,
-            disk_size: disk.into_inner(),
-            size: size.into_inner(),
-            file_count: count.into_inner(),
+        .zip(table)
+        .map(|(bucket, (disk_size, size, file_count))| AgeStat {
+            bucket: bucket.into(),
+            disk_size,
+            size,
+            file_count,
         })
         .collect()
 }
@@ -539,6 +696,43 @@ mod tests {
         assert_eq!(top(10, &new).len(), 4);
 
         assert_eq!(by_age(&s.tree)[0].file_count, 4);
+    }
+
+    #[test]
+    fn deep_tree_queries_match_serial_totals() {
+        // Deeper than the parallel walk's cutoff, so the serial per-chunk
+        // accumulation and the merges are exercised too.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let mut deep = p.to_path_buf();
+        for i in 0..10 {
+            deep.push(format!("d{i}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        for i in 0..50 {
+            fs::write(deep.join(format!("f{i:02}.bin")), vec![1u8; 1_000 + i]).unwrap();
+        }
+        fs::write(p.join("top.TXT"), vec![1u8; 500]).unwrap();
+        let s = scan(p, &ScanOptions::default()).unwrap();
+        let m = SizeMode::Apparent;
+
+        let stats = by_extension(&s.tree, 10, m);
+        let bin = stats.iter().find(|x| x.extension == "bin").unwrap();
+        assert_eq!(bin.file_count, 50);
+        assert_eq!(bin.size, (1_000..1_050).sum::<u64>());
+        let txt = stats.iter().find(|x| x.extension == "txt").unwrap();
+        assert_eq!(txt.file_count, 1);
+        assert_eq!(txt.size, 500);
+
+        let ages = by_age(&s.tree);
+        assert_eq!(ages.iter().map(|a| a.file_count).sum::<u64>(), 51);
+
+        let top = largest_files(&s.tree, &s.root, 5, &FileFilter::default(), m);
+        assert_eq!(top.len(), 5);
+        assert_eq!(top[0].size, 1_049);
+        assert!(top[0].path.ends_with("f49.bin"));
+        // Every path is the full path from the scan root.
+        assert!(top[0].path.starts_with(&s.root));
     }
 
     #[test]

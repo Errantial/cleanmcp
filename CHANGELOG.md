@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.6.0 - 2026-11-04
+
+Parallel whole-tree queries, benchmarked against `dua`, `dust` and `gdu`. No breaking changes;
+commands, flags and the snapshot format are unchanged.
+
+### Speed
+- Every whole-tree query now walks the tree in parallel with per-chunk accumulators that are
+  merged up the tree, instead of one shared lock or a single thread. Measured in-process
+  (min of 3) on `C:\Users\Emil` (5.45M files, 676k dirs) and `C:\Users\Emil\AppData`
+  (853k files): `ext` 3050 -> 130 ms (23x) and 607 -> 90 ms (6.7x), `age` 281 -> 17 ms and
+  40 -> 7 ms, `files` 282 -> 44 ms and 42 -> 20 ms, `suggest` 274 -> 30 ms and 56 -> 19 ms.
+  `by_extension` also no longer allocates a `String` per file: a repeat extension is found
+  with a borrowed `&str` and allocates nothing. `dupes` counts sizes and collects candidate
+  paths in parallel too. The MCP tools share these functions, so they speed up the same way
+  on cached scans. Details and methodology: `docs/benchmarks.md`.
+- Benchmarked against dua v3.0.0, dust v1.2.7 and gdu v5.38.0 (Windows x86_64, warm cache,
+  interleaved runs): on `C:\Users\Emil\AppData` (957k entries, 172 GiB) cleanmcp scans in
+  2.99 s vs dua 3.52 s, gdu 3.90 s, dust 39.97 s; on `C:\Users\Emil` (6.1M entries, 577 GiB)
+  21.2 s vs dua 21.2 s, gdu 20.7 s, dust 311 s, with the lowest CPU of the three fast tools
+  (241 s vs 269/272 s on the profile). Peak memory is ~87 bytes/entry vs dua's ~52.
+
+### CLI
+- `files --sort age` now sorts files with an unknown modification time last instead of
+  first: "oldest first" should not lead with files whose age is unknown.
+
 ## 0.5.0 - 2026-11-04
 
 Faster breakdowns on big trees, and small CLI/MCP conveniences. One breaking change: the shape

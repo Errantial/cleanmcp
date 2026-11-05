@@ -115,15 +115,28 @@ pub fn same_size_files(
     opts: &DupeOptions,
 ) -> Vec<(u64, Vec<DupeCandidate>)> {
     let min = opts.min_size.max(1);
-    let mut counts: HashMap<u64, u32> = HashMap::new();
-    count_sizes(root, min, &mut counts);
+    // Pass 1: count sizes in parallel, each chunk of the walk with its own map.
+    let mut counts: HashMap<u64, u32> = crate::query::fold_files_par(
+        root,
+        &HashMap::new,
+        &|t: &mut HashMap<u64, u32>, node| {
+            if node.size >= min {
+                *t.entry(node.size).or_default() += 1;
+            }
+        },
+        &|mut a, b| {
+            for (k, v) in b {
+                *a.entry(k).or_default() += v;
+            }
+            a
+        },
+    );
     counts.retain(|_, n| *n > 1);
     if counts.is_empty() {
         return Vec::new();
     }
-    let mut by_size: HashMap<u64, Vec<DupeCandidate>> = HashMap::with_capacity(counts.len());
-    let mut path = base.to_path_buf();
-    collect_paths(root, min, &counts, &mut path, &mut by_size);
+    // Pass 2: build paths for the surviving sizes, in parallel.
+    let by_size = collect_paths_par(root, base, min, &counts);
     // Biggest files first: the hashing pass is I/O bound and this order gives the
     // long reads to the pool before the short ones.
     let mut out: Vec<(u64, Vec<DupeCandidate>)> = by_size.into_iter().collect();
@@ -131,25 +144,67 @@ pub fn same_size_files(
     out
 }
 
-fn count_sizes(node: &Node, min: u64, counts: &mut HashMap<u64, u32>) {
-    for c in node.children() {
-        match c.kind() {
-            NodeKind::File => {
-                if c.size >= min {
-                    *counts.entry(c.size).or_default() += 1;
-                }
-            }
-            NodeKind::Dir => count_sizes(c, min, counts),
-            _ => {}
-        }
-    }
-}
-
-fn collect_paths(
+/// Parallel path collection: each branch builds its own map and the maps are
+/// merged up the tree, so a big tree no longer walks on one thread. Below
+/// [`PAR_DEPTH`] the walk is serial and reuses one path buffer.
+fn collect_paths_par(
     node: &Node,
+    path: &Path,
     min: u64,
     counts: &HashMap<u64, u32>,
+) -> HashMap<u64, Vec<DupeCandidate>> {
+    collect_paths_at(node, path, min, counts, 0)
+}
+
+fn collect_paths_at(
+    node: &Node,
+    path: &Path,
+    min: u64,
+    counts: &HashMap<u64, u32>,
+    depth: usize,
+) -> HashMap<u64, Vec<DupeCandidate>> {
+    if depth >= crate::query::PAR_DEPTH {
+        let mut out = HashMap::new();
+        let mut p = path.to_path_buf();
+        collect_paths_serial(node, &mut p, min, counts, &mut out);
+        return out;
+    }
+    node.children()
+        .par_iter()
+        .map(|c| match c.kind() {
+            NodeKind::File => {
+                let mut out: HashMap<u64, Vec<DupeCandidate>> = HashMap::new();
+                if c.size >= min && counts.contains_key(&c.size) {
+                    let mut p = path.to_path_buf();
+                    p.push(c.name.as_str());
+                    out.entry(c.size).or_default().push(DupeCandidate {
+                        path: p,
+                        disk_size: c.disk_size,
+                    });
+                }
+                out
+            }
+            NodeKind::Dir => {
+                let mut p = path.to_path_buf();
+                p.push(c.name.as_str());
+                collect_paths_at(c, &p, min, counts, depth + 1)
+            }
+            _ => HashMap::new(),
+        })
+        .reduce(HashMap::new, |mut a, b| {
+            for (k, v) in b {
+                a.entry(k).or_default().extend(v);
+            }
+            a
+        })
+}
+
+/// Serial path collection below the parallel cutoff, reusing one path buffer.
+fn collect_paths_serial(
+    node: &Node,
     path: &mut PathBuf,
+    min: u64,
+    counts: &HashMap<u64, u32>,
     out: &mut HashMap<u64, Vec<DupeCandidate>>,
 ) {
     for c in node.children() {
@@ -166,7 +221,7 @@ fn collect_paths(
             }
             NodeKind::Dir => {
                 path.push(c.name.as_str());
-                collect_paths(c, min, counts, path, out);
+                collect_paths_serial(c, path, min, counts, out);
                 path.pop();
             }
             _ => {}
@@ -647,6 +702,41 @@ mod tests {
         assert_eq!(group.wasted_by(SizeMode::Apparent), 200);
         assert_eq!(group.size_by(SizeMode::Disk), 8192);
         assert_eq!(group.wasted_by(SizeMode::Disk), 8192);
+    }
+
+    #[test]
+    fn same_size_files_in_deep_subtrees_keep_full_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let mut deep = p.to_path_buf();
+        for i in 0..8 {
+            deep.push(format!("d{i}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("a.bin"), vec![7u8; 4_096]).unwrap();
+        fs::write(p.join("b.bin"), vec![7u8; 4_096]).unwrap();
+        fs::write(deep.join("c.bin"), vec![7u8; 4_096]).unwrap();
+        fs::write(p.join("unique.bin"), vec![1u8; 123]).unwrap();
+
+        let s = scan(p, &ScanOptions::default()).unwrap();
+        let sizes = same_size_files(&s.tree, &s.root, &DupeOptions { min_size: 1 });
+        assert_eq!(sizes.len(), 1);
+        assert_eq!(sizes[0].0, 4_096);
+        let mut names: Vec<String> = sizes[0]
+            .1
+            .iter()
+            .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.bin", "b.bin", "c.bin"]);
+        // Paths are full paths from the scan root, not just file names.
+        assert!(sizes[0].1.iter().all(|c| c.path.starts_with(&s.root)));
+        assert!(
+            sizes[0]
+                .1
+                .iter()
+                .any(|c| c.path.ends_with(Path::new("d7").join("a.bin")))
+        );
     }
 
     #[test]

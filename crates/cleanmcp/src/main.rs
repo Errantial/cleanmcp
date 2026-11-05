@@ -405,7 +405,8 @@ fn main() -> Result<()> {
             match sort {
                 SortBy::Size => {}
                 SortBy::Name => files.sort_by(|a, b| a.path.cmp(&b.path)),
-                SortBy::Age => files.sort_by_key(|f| std::cmp::Reverse(f.age_days)),
+                // Oldest first; an unknown age is not "old", so it sorts last.
+                SortBy::Age => files.sort_by_key(|f| std::cmp::Reverse(f.age_days.unwrap_or(0))),
             }
             if json {
                 output::print_json(&files)

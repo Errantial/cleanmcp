@@ -18,7 +18,48 @@ What made the difference:
   (e.g. after WSL touched them). Treating it as "special" caused one extra syscall per file. 1M files: 17.2 s -> 2.5 s.
 - `CompactString` names (inline up to 24 bytes) remove one heap allocation per entry.
 
-Comparisons with `dua`, `dust`, `gdu` are pending (see the optimization pass).
+Comparisons with `dua`, `dust`, `gdu` are in the v0.6.0 section below.
+
+## v0.6.0 (query parallelism + competitor comparison)
+
+Machine: Windows 11, 24 logical CPUs, NVMe SSD. Release build. "Warm" = after a warmup run,
+tools run interleaved (round-robin) so OS cache and machine load hit every tool equally.
+
+### Scan vs dua / dust / gdu (whole-tree scan, wall time min of runs)
+
+| Target | cleanmcp 0.5.0 | dua v3.0.0 | dust v1.2.7 | gdu v5.38.0 |
+|---|---|---|---|---|
+| `C:\Users\Emil\AppData` (957k entries, 172 GiB) | **2.99 s** | 3.52 s | 39.97 s | 3.90 s |
+| `C:\Users\Emil` (6.1M entries, 577 GiB) | 21.22 s | 21.20 s | 311.19 s | **20.69 s** |
+
+CPU seconds (min) and peak working set on the same runs:
+
+| Target | cleanmcp | dua | dust | gdu |
+|---|---|---|---|---|
+| AppData | cpu 36.2 s, 128 MB | cpu 48.2 s, 90 MB | cpu 344 s, 383 MB | cpu 45.4 s, 82 MB |
+| Profile | cpu 241 s, 531 MB | cpu 269 s, 317 MB | cpu 2167 s, 2199 MB | cpu 272 s, 58 MB |
+
+cleanmcp is the fastest on the smaller tree and at parity with dua/gdu on the big profile,
+with the lowest CPU of the three fast tools. It uses more memory than dua (~87 vs ~52 bytes
+per entry: 64-byte nodes with inline names plus one heap allocation per long name, where dua
+stores names in an arena). dust is an order of magnitude slower on Windows; gdu's peak looks
+low because Go returns memory to the OS between runs.
+
+### Queries on a scanned tree (in-process, min of 3, `querybench` example)
+
+v0.6.0 walks every whole-tree query in parallel with per-chunk accumulators merged up the
+tree (no shared lock, no per-file allocation), instead of one mutex or a single thread.
+
+| Query | v0.5.0 profile | v0.6.0 profile | v0.5.0 AppData | v0.6.0 AppData |
+|---|---|---|---|---|
+| `by_extension` (`ext`) | 3050 ms | **130 ms** (23x) | 607 ms | **90 ms** (6.7x) |
+| `by_age` (`age`) | 281 ms | **17 ms** (16x) | 40 ms | **7 ms** (5.7x) |
+| `largest_files` (`files`) | 282 ms | **44 ms** (6.4x) | 42 ms | **20 ms** (2.1x) |
+| `find_candidates` (`suggest`) | 274 ms | **30 ms** (9x) | 56 ms | **19 ms** (2.9x) |
+
+Profile = `C:\Users\Emil` (5.45M files, 676k dirs); AppData = `C:\Users\Emil\AppData`
+(853k files, 105k dirs). The scan itself is unchanged (2.5 s on AppData in both versions);
+the MCP tools share these functions, so they speed up the same way on cached scans.
 
 ## Optimization pass (after 0.1.0)
 

@@ -595,12 +595,7 @@ impl CleanMcp {
                 let s = scan.read().unwrap();
                 let node = find(&s, &scan_path)?;
                 Ok::<_, String>(TreeJson::build_page(
-                    node,
-                    &scan_path,
-                    depth,
-                    top,
-                    offset,
-                    size_mode,
+                    node, &scan_path, depth, top, offset, size_mode,
                 ))
             })
             .await
@@ -639,11 +634,7 @@ impl CleanMcp {
             let s = scan.read().unwrap();
             let node = find(&s, &path)?;
             Ok::<_, String>(query::largest_files(
-                node,
-                &path,
-                wanted,
-                &filter,
-                size_mode,
+                node, &path, wanted, &filter, size_mode,
             ))
         })
         .await
@@ -716,11 +707,7 @@ impl CleanMcp {
             let s = scan.read().unwrap();
             let node = find(&s, &path)?;
             Ok::<_, String>(rules::find_candidates(
-                &rules,
-                node,
-                &path,
-                min_size,
-                size_mode,
+                &rules, node, &path, min_size, size_mode,
             ))
         })
         .await
@@ -869,9 +856,7 @@ impl CleanMcp {
                 } else if new_path.is_dir() {
                     let o = snapshot::load_truncated(&old_path, depth)
                         .map_err(|e| format!("cannot read {}: {e}", old_path.display()))?;
-                    let n = self
-                        .get_scan(n, true, false, false, None, ct)
-                        .await?;
+                    let n = self.get_scan(n, true, false, false, None, ct).await?;
                     let sub = {
                         let n = n.read().unwrap();
                         // The cached scan may cover a parent; diff against the asked folder.
