@@ -1,13 +1,13 @@
 {
-    "version": "0.5.0",
+    "version": "0.6.0",
     "description": "TreeSize-style disk usage CLI with a built-in MCP server for AI agents",
     "homepage": "https://github.com/Errantial/cleanmcp",
     "license": "MIT|Apache-2.0",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/Errantial/cleanmcp/releases/download/v0.5.0/cleanmcp-0.5.0-x86_64-pc-windows-msvc.zip",
-            "hash": "9258b8d11b959c5123720bef8bfe38fd47f751da6c25b0913f8307df69d708a5",
-            "extract_dir": "cleanmcp-0.5.0-x86_64-pc-windows-msvc"
+            "url": "https://github.com/Errantial/cleanmcp/releases/download/v0.6.0/cleanmcp-0.6.0-x86_64-pc-windows-msvc.zip",
+            "hash": "4a0d79dc2f532d9ff4ad7f611ff8b7af99b60a486e23c51ebad8cf85702954b8",
+            "extract_dir": "cleanmcp-0.6.0-x86_64-pc-windows-msvc"
         }
     },
     "bin": "cleanmcp.exe",
