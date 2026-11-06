@@ -75,6 +75,92 @@ pub fn print_scan_notes(s: &Scan) {
     }
 }
 
+/// `du`-style output: `<size>\t<path>` for every directory (files too with `all`).
+pub fn print_du(s: &Scan, all: bool, mode: SizeMode) {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut path = s.root.clone();
+    let _ = du_walk(&s.tree, &mut path, all, mode, &mut out);
+}
+
+fn du_walk(
+    node: &Node,
+    path: &mut PathBuf,
+    all: bool,
+    mode: SizeMode,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
+    if node.kind() != NodeKind::Dir {
+        if all {
+            writeln!(out, "{}\t{}", node.size_by(mode), path.display())?;
+        }
+        return Ok(());
+    }
+    writeln!(out, "{}\t{}", node.size_by(mode), path.display())?;
+    for c in node.children() {
+        path.push(c.name.as_str());
+        du_walk(c, path, all, mode, out)?;
+        path.pop();
+    }
+    Ok(())
+}
+
+/// JSON document for `du --json`.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct DuJson {
+    pub root: PathBuf,
+    pub size_mode: String,
+    pub entries: Vec<DuEntry>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct DuEntry {
+    /// Size in the requested mode (disk by default).
+    pub size: u64,
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
+impl DuJson {
+    pub fn build(s: &Scan, all: bool, mode: SizeMode) -> Self {
+        let mut entries = Vec::new();
+        let mut path = s.root.clone();
+        du_collect(&s.tree, &mut path, all, mode, &mut entries);
+        DuJson {
+            root: s.root.clone(),
+            size_mode: if mode == SizeMode::Apparent {
+                "apparent".into()
+            } else {
+                "disk".into()
+            },
+            entries,
+        }
+    }
+}
+
+fn du_collect(node: &Node, path: &mut PathBuf, all: bool, mode: SizeMode, out: &mut Vec<DuEntry>) {
+    if node.kind() != NodeKind::Dir {
+        if all {
+            out.push(DuEntry {
+                size: node.size_by(mode),
+                path: path.clone(),
+                is_dir: false,
+            });
+        }
+        return;
+    }
+    out.push(DuEntry {
+        size: node.size_by(mode),
+        path: path.clone(),
+        is_dir: true,
+    });
+    for c in node.children() {
+        path.push(c.name.as_str());
+        du_collect(c, path, all, mode, out);
+        path.pop();
+    }
+}
+
 fn print_children(node: &Node, indent: &str, depth: usize, top: usize, mode: SizeMode) {
     if depth == 0 {
         return;

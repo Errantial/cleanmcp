@@ -1,11 +1,15 @@
 #!/bin/sh
-# Install the latest cleanmcp release on Linux (x86_64 or arm64).
+# Install the latest cleanmcp release on Linux or macOS (x86_64 or arm64).
 #   curl -fsSL https://raw.githubusercontent.com/Errantial/cleanmcp/main/install.sh | sh
 # Options (environment): CLEANMCP_VERSION=v0.1.0, CLEANMCP_INSTALL_DIR=~/.local/bin
 set -eu
 
 REPO="Errantial/cleanmcp"
-[ "$(uname -s)" = "Linux" ] || { echo "This script is for Linux. On Windows use install.ps1." >&2; exit 1; }
+case "$(uname -s)" in
+  Linux)  TARGET="unknown-linux-musl" ;;
+  Darwin) TARGET="apple-darwin" ;;
+  *) echo "This script is for Linux and macOS. On Windows use install.ps1." >&2; exit 1 ;;
+esac
 case "$(uname -m)" in
   x86_64 | amd64) ARCH="x86_64" ;;
   aarch64 | arm64) ARCH="aarch64" ;;
@@ -19,7 +23,7 @@ fi
 [ -n "$TAG" ] || { echo "Could not find the latest release." >&2; exit 1; }
 TAG="v${TAG#v}" # accept 0.1.0 or v0.1.0
 
-NAME="cleanmcp-${TAG#v}-$ARCH-unknown-linux-musl"
+NAME="cleanmcp-${TAG#v}-$ARCH-$TARGET"
 BASE="https://github.com/$REPO/releases/download/$TAG"
 DEST="${CLEANMCP_INSTALL_DIR:-$HOME/.local/bin}"
 TMP=$(mktemp -d)

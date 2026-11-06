@@ -456,6 +456,8 @@ pub struct ScanSettings {
     pub include_virtual: bool,
     pub dedupe_hardlinks: bool,
     pub exclude: Vec<String>,
+    /// `.gitignore` / `.ignore` files were not respected (scanned with `--no-ignore`).
+    pub no_ignore: bool,
 }
 
 /// A scanned tree plus the root path it was scanned from.

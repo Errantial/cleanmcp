@@ -45,6 +45,9 @@ pub struct ScanArgs {
     /// Count hard-linked files once on Windows (slower). Always on for Linux.
     #[arg(long)]
     pub dedupe_hardlinks: bool,
+    /// Do not respect .gitignore / .ignore files while scanning.
+    #[arg(long)]
+    pub no_ignore: bool,
     /// Do not show the progress line on stderr.
     #[arg(short, long)]
     pub quiet: bool,
@@ -65,6 +68,7 @@ impl ScanArgs {
             include_virtual: self.include_virtual,
             dedupe_hardlinks: self.dedupe_hardlinks,
             exclude: self.exclude.iter().chain(&cfg.exclude).cloned().collect(),
+            no_ignore: self.no_ignore || cfg.no_ignore,
             ..Default::default()
         };
         run_scan(&self.path, opts, self.quiet)
@@ -134,6 +138,16 @@ enum Command {
     Ui {
         #[command(flatten)]
         scan: ScanArgs,
+    },
+    /// Print disk usage in `du` format: `<size>\\t<path>` per directory (files too with -a).
+    Du {
+        #[command(flatten)]
+        scan: ScanArgs,
+        /// Also list files (like `du -a`).
+        #[arg(short = 'a', long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Show a size tree of a directory (largest first).
     Tree {
@@ -366,6 +380,17 @@ fn main() -> Result<()> {
             let cfg = config()?;
             let s = scan.run(&cfg)?;
             ui::run(s, scan.mode())
+        }
+        Command::Du { scan, all, json } => {
+            let cfg = config()?;
+            let s = scan.run(&cfg)?;
+            let mode = scan.mode();
+            if json {
+                output::print_json(&output::DuJson::build(&s, all, mode))
+            } else {
+                output::print_du(&s, all, mode);
+                Ok(())
+            }
         }
         Command::Tree {
             scan,

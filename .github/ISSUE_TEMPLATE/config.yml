@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security issue (private)
+    url: https://github.com/Errantial/cleanmcp/security/advisories/new
+    about: Please report vulnerabilities privately, not as a public issue
+  - name: Question / discussion
+    url: https://github.com/Errantial/cleanmcp/discussions
+    about: Ask questions and share ideas in Discussions

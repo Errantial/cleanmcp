@@ -87,11 +87,21 @@ The CLI and MCP server both call `cleanmcp-core`, so their answers always match.
 - [x] End-to-end tests drive the real binary with the rmcp client (`crates/cleanmcp/tests/mcp_stdio.rs`)
 
 ### Milestone 5: distribution
-- [x] Release workflow (`.github/workflows/release.yml`): on a `v*` tag, builds `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` on native runners, packages zip / tar.gz with completions, man page and licenses, publishes a GitHub release with SHA256SUMS and notes from CHANGELOG.md
-- [x] Install scripts with checksum verification: `install.ps1` (Windows, adds to user PATH) and `install.sh` (Linux)
+- [x] Release workflow (`.github/workflows/release.yml`): on a `v*` tag, builds `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-apple-darwin` on native runners, packages zip / tar.gz with completions, man page and licenses, publishes a GitHub release with SHA256SUMS, an SBOM and build-provenance attestations, and notes from CHANGELOG.md; nightly cron builds every target and uploads to a rolling `nightly` pre-release
+- [x] Install scripts with checksum verification: `install.ps1` (Windows, adds to user PATH) and `install.sh` (Linux + macOS)
 - [x] `cargo install --git`; Scoop bucket manifest in this repo; AUR `PKGBUILD` (cleanmcp-bin) in `packaging/aur`
 - [x] Shell completions (`cleanmcp completions`) and man page (`cleanmcp man`)
-- [ ] Not done (needs accounts/approval outside this repo): crates.io publish, winget-pkgs PR, AUR upload, Homebrew tap
+- [x] `server.json` for the official MCP registry (publishing needs ghcr + `mcp-publisher`, see `docs/mcp-setup.md`)
+- [x] Community scaffolding: CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md, issue/PR templates, FUNDING.yml; CI runs fmt/clippy/test on Ubuntu+Windows+macOS, MSRV 1.88, and `cargo deny check`
+- [x] Reproducible benchmarks committed in `scripts/bench/` (scan comparison vs dua/dust/gdu + in-process query bench)
+- [ ] Not done (needs accounts/approval outside this repo): crates.io publish, winget-pkgs PR, AUR upload, Homebrew tap, MCP registry publish
+
+### Milestone 6: v1.0 polish (done in 1.0.0)
+- [x] `.gitignore` / `.ignore` respected while scanning (`--no-ignore` or `no_ignore` in config to disable); per-directory matchers merged down the tree with git's override semantics
+- [x] `cleanmcp du [PATH] [-a] [--json]`: `du`-compatible `<size>\t<path>` output
+- [x] Scan errors surfaced everywhere: stderr note, `tree --json` `errors` field, MCP `scan_directory` result
+- [x] CLI integration tests (`crates/cleanmcp/tests/cli.rs`) drive the real binary over a fixture tree
+- [x] README comparison matrix + FAQ; `docs/competitive-release-plan.md` tracks the release-readiness work
 
 ## Safety principles
 

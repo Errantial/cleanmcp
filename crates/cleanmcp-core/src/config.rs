@@ -6,6 +6,8 @@
 //! ```toml
 //! # Always skip these while scanning (same syntax as --exclude).
 //! exclude = ["**/.git"]
+//! # Do not respect .gitignore / .ignore files while scanning (same as --no-ignore).
+//! no_ignore = false
 //! # Turn off built-in rules by id (see `cleanmcp rules`).
 //! disable_rules = ["xdg_cache"]
 //!
@@ -28,6 +30,8 @@ use crate::rules::{Rule, RuleSet, builtin_rules};
 pub struct Config {
     #[serde(default)]
     pub exclude: Vec<String>,
+    #[serde(default)]
+    pub no_ignore: bool,
     #[serde(default)]
     pub disable_rules: Vec<String>,
     #[serde(default, rename = "rule")]

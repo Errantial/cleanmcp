@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
+  "name": "io.github.errantial/cleanmcp",
+  "title": "CleanMCP",
+  "description": "TreeSize-style disk usage explorer for AI agents: scan drives, drill into big folders, find largest/oldest files, duplicates and cleanup candidates. Read-only by default; optional move_to_trash with --allow-delete.",
+  "version": "1.0.0",
+  "homepage": "https://github.com/Errantial/cleanmcp",
+  "repository": {
+    "url": "https://github.com/Errantial/cleanmcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/errantial/cleanmcp-mcp",
+      "version": "1.0.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

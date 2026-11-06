@@ -105,3 +105,18 @@ session).
 
 > My C: drive is almost full. Use cleanmcp to find what is taking space and what I can safely
 > clean up. Show me a list with sizes before deleting anything.
+
+## Registry listing (official MCP registry)
+
+`server.json` at the repo root is the manifest for the
+[official MCP registry](https://github.com/modelcontextprotocol/registry). Publishing needs a
+container image and the `mcp-publisher` CLI, so it is a follow-up outside this repo:
+
+```sh
+docker build -t ghcr.io/errantial/cleanmcp-mcp:1.0.0 -f packaging/mcp.Dockerfile .
+docker push ghcr.io/errantial/cleanmcp-mcp:1.0.0
+mcp-publisher login github-oidc   # uses the release workflow's id-token
+mcp-publisher publish              # reads server.json
+```
+
+Until then, agents install with `claude mcp add --scope user cleanmcp -- cleanmcp mcp` as above.

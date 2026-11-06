@@ -3,10 +3,13 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Nightly: build every target from main and upload to the "nightly" pre-release.
+  schedule:
+    - cron: "0 3 * * *"
   # Manual runs build and upload artifacts without publishing a release.
   workflow_dispatch:
 
-# Read-only by default; only the publish job may create the release.
+# Read-only by default; only the publish job may create releases / attest.
 permissions:
   contents: read
 
@@ -27,6 +30,10 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -66,10 +73,11 @@ jobs:
 
   publish:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write   # artifact attestations
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -79,12 +87,37 @@ jobs:
       - name: Checksums and release notes
         run: |
           cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS && cd ..
-          VERSION="${GITHUB_REF_NAME#v}"
-          # The section of CHANGELOG.md whose heading is exactly "## <version> ...".
-          awk -v v="$VERSION" '/^## /{f = ($2 == v); next} f' CHANGELOG.md > notes.md
-          if ! grep -q '[^[:space:]]' notes.md; then echo "::error::CHANGELOG.md has no section for $VERSION"; exit 1; fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            # The section of CHANGELOG.md whose heading is exactly "## <version> ...".
+            awk -v v="$VERSION" '/^## /{f = ($2 == v); next} f' CHANGELOG.md > notes.md
+            if ! grep -q '[^[:space:]]' notes.md; then echo "::error::CHANGELOG.md has no section for $VERSION"; exit 1; fi
+          else
+            echo "Nightly build from main at ${GITHUB_SHA}. Not a stable release." > notes.md
+          fi
           cat notes.md
+      - name: SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: dist
+          artifact-name: sbom
+          output-file: sbom.spdx.json
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/*'
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "cleanmcp $GITHUB_REF_NAME" --notes-file notes.md
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            gh release create "$GITHUB_REF_NAME" dist/* sbom.spdx.json --repo "$GITHUB_REPOSITORY" --title "cleanmcp $GITHUB_REF_NAME" --notes-file notes.md
+          else
+            # Nightly: one rolling pre-release, artifacts clobbered each run.
+            if gh release view nightly --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release upload nightly dist/* sbom.spdx.json --repo "$GITHUB_REPOSITORY" --clobber
+              gh release edit nightly --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+            else
+              gh release create nightly dist/* sbom.spdx.json --repo "$GITHUB_REPOSITORY" --title "cleanmcp nightly" --prerelease --notes-file notes.md
+            fi
+          fi

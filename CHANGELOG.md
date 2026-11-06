@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.0.0 - 2026-11-05
+
+Release-ready: every platform we support, verifiable releases, and the ignore-file behavior
+people expect from modern disk tools. No breaking changes; commands, flags and the snapshot
+format are backward compatible (old snapshots still load).
+
+### Features
+- `.gitignore` and `.ignore` files are now respected while scanning, with git's override
+  semantics (deeper files win, `!` negations work). Disable with `--no-ignore` or
+  `no_ignore = true` in `config.toml`. The common case costs no extra syscalls: ignore files
+  are detected from the directory listing itself.
+- New `cleanmcp du [PATH] [-a] [--json]`: `du`-compatible `<size>\t<path>` output for every
+  directory (files too with `-a`).
+- Scan errors are surfaced everywhere they were previously only on stderr: `tree --json` has an
+  `errors` field per node, and the MCP `scan_directory` result reports `errors`.
+
+### Platforms & distribution
+- macOS builds: `aarch64-apple-darwin` and `x86_64-apple-darwin` are now built and released;
+  `install.sh` covers Darwin; CI tests on macOS too.
+- Every release now ships SHA256SUMS, an SPDX SBOM (`sbom.spdx.json`) and build-provenance
+  attestations (`gh attestation verify`).
+- Nightly builds: a scheduled workflow builds all five targets from `main` and uploads them to
+  a rolling `nightly` pre-release.
+- `server.json` added for the official MCP registry (publishing is a follow-up needing ghcr).
+- Reproducible benchmarks committed under `scripts/bench/` (see `docs/benchmarks.md`).
+
+### Process
+- CONTRIBUTING.md, SECURITY.md (private reporting via GitHub advisories), CODE_OF_CONDUCT.md,
+  issue/PR templates, FUNDING.yml.
+- CI: fmt + clippy + tests on Ubuntu/Windows/macOS, MSRV 1.88 check, and `cargo deny check`
+  (licenses + advisories) via `deny.toml`.
+- New CLI integration tests (`crates/cleanmcp/tests/cli.rs`) drive the real binary over a fixture
+  tree: `tree/files/ext/age/suggest --json`, `du` format, `--no-ignore`, `--exclude`,
+  snapshot/diff round-trip, and error messages.
+- README gained a comparison matrix vs dua/dust/gdu/ncdu/TreeSize and an FAQ.
+
 ## 0.6.0 - 2026-11-04
 
 Parallel whole-tree queries, benchmarked against `dua`, `dust` and `gdu`. No breaking changes;

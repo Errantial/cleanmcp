@@ -9,6 +9,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use compact_str::CompactString;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use rayon::prelude::*;
 
 use crate::os::{self, FileId, FsInfo};
@@ -44,6 +45,8 @@ pub struct ScanOptions {
     /// Glob patterns to skip, matched against the entry name and its full path
     /// (with `/` separators), e.g. `node_modules` or `**/.git`.
     pub exclude: Vec<String>,
+    /// Do not respect `.gitignore` / `.ignore` files while scanning.
+    pub no_ignore: bool,
     /// Progress counters / cancellation. Keep a clone to watch or cancel the scan.
     pub control: Arc<ScanControl>,
 }
@@ -56,6 +59,7 @@ impl ScanOptions {
             include_virtual: s.include_virtual,
             dedupe_hardlinks: s.dedupe_hardlinks,
             exclude: s.exclude.clone(),
+            no_ignore: s.no_ignore,
             control: Default::default(),
         }
     }
@@ -66,6 +70,7 @@ impl ScanOptions {
             include_virtual: self.include_virtual,
             dedupe_hardlinks: self.dedupe_hardlinks,
             exclude: self.exclude.clone(),
+            no_ignore: self.no_ignore,
         }
     }
 }
@@ -106,8 +111,15 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> io::Result<Scan> {
     };
     let name = root.to_string_lossy();
     let mtime = os::meta_mtime(&meta);
+    let no_ig: IgnoreStack = Vec::new();
     let tree = if meta.is_dir() {
-        scan_dir(&ctx, &root, CompactString::from(name.as_ref()), mtime)
+        scan_dir(
+            &ctx,
+            &root,
+            CompactString::from(name.as_ref()),
+            mtime,
+            &no_ig,
+        )
     } else {
         let entry = os::FsEntry::from_meta(&name, root.as_os_str(), &meta, mtime);
         let node = file_node(&ctx, &root, &entry);
@@ -216,7 +228,44 @@ fn file_node(ctx: &Ctx, path: &Path, e: &os::FsEntry<'_>) -> Node {
     node
 }
 
-fn scan_dir(ctx: &Ctx, path: &Path, name: CompactString, mtime: u32) -> Node {
+/// Active ignore rules on the way down from the scan root: one entry per
+/// directory that had a `.gitignore` or `.ignore` file, with the directory as
+/// the matcher's root. Deeper entries override shallower ones, like git.
+type IgnoreStack = Vec<(PathBuf, Arc<Gitignore>)>;
+
+/// Build the matcher for `dir/.gitignore` (or `.ignore`). `None` when the file
+/// cannot be read: an unreadable ignore file must not fail the whole scan.
+fn build_gitignore(dir: &Path, file: &str) -> Option<Arc<Gitignore>> {
+    let mut b = GitignoreBuilder::new(dir);
+    let _ = b.case_insensitive(cfg!(windows));
+    if b.add(dir.join(file)).is_some() {
+        return None; // unreadable ignore file: no rules, but do not fail the scan
+    }
+    b.build().ok().map(Arc::new)
+}
+
+/// git semantics: the deepest matcher that says anything wins. `matched`
+/// strips the matcher's root itself and reports `None` for paths outside it.
+fn is_ignored(ig: &IgnoreStack, path: &Path, is_dir: bool) -> bool {
+    let mut ignored = false;
+    for (_, g) in ig {
+        let m = g.matched(path, is_dir);
+        if m.is_ignore() {
+            ignored = true;
+        } else if m.is_whitelist() {
+            ignored = false;
+        }
+    }
+    ignored
+}
+
+fn scan_dir(
+    ctx: &Ctx,
+    path: &Path,
+    name: CompactString,
+    mtime: u32,
+    parent_ig: &IgnoreStack,
+) -> Node {
     let mut node = Node::new(NodeKind::Dir, name, 0, 0, mtime);
     // Progress counters are batched per directory: two atomic updates instead of
     // two per entry, which keeps 24 threads off the same cache line.
@@ -238,11 +287,22 @@ fn scan_dir(ctx: &Ctx, path: &Path, name: CompactString, mtime: u32) -> Node {
     let mut scratch = ChildPath::new(path);
     let mut excluded = 0u64;
     let mut mounts = 0u64;
+    // Ignore files are found in the listing itself, so the common case (no
+    // ignore files anywhere) costs two string compares per entry and no syscalls.
+    let mut has_gitignore = false;
+    let mut has_ignore = false;
 
     let walked = os::walk_dir(path, &mut |e| {
         // Reset from the previous entry before appending this one.
         scratch.reset();
         let child = scratch.set(e);
+        if !ctx.opts.no_ignore && e.kind == NodeKind::File {
+            if e.name == ".gitignore" {
+                has_gitignore = true;
+            } else if e.name == ".ignore" {
+                has_ignore = true;
+            }
+        }
         // globset normalizes `\` to `/` itself on Windows.
         if let Some(set) = &ctx.exclude
             && (set.is_match(e.name) || set.is_match(child))
@@ -275,10 +335,27 @@ fn scan_dir(ctx: &Ctx, path: &Path, name: CompactString, mtime: u32) -> Node {
         Err(_) => node.add_error(),
     }
 
+    // Load this directory's ignore files (if the listing had any) and filter
+    // the entries collected above; ancestors' rules apply too.
+    let mut ig = parent_ig.clone();
+    if !ctx.opts.no_ignore {
+        for (present, file) in [(&has_gitignore, ".gitignore"), (&has_ignore, ".ignore")] {
+            if *present && let Some(g) = build_gitignore(path, file) {
+                ig.push((path.to_path_buf(), g));
+            }
+        }
+    }
+    if !ig.is_empty() {
+        let before = children.len() + subdirs.len();
+        children.retain(|n| !is_ignored(&ig, &path.join(n.name.as_str()), false));
+        subdirs.retain(|(p, _, _)| !is_ignored(&ig, p, true));
+        excluded += (before - children.len() - subdirs.len()) as u64;
+    }
+
     // Recurse into subdirectories in parallel.
     let dirs: Vec<Node> = subdirs
         .into_par_iter()
-        .map(|(p, n, m)| scan_dir(ctx, &p, n, m))
+        .map(|(p, n, m)| scan_dir(ctx, &p, n, m, &ig))
         .collect();
     children.extend(dirs);
     node.set_children(children);
@@ -348,6 +425,52 @@ mod tests {
             ..opts()
         };
         assert_eq!(scan(dir.path(), &o).unwrap().tree.size, 7);
+    }
+
+    #[test]
+    fn gitignore_and_ignore_files_are_respected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        fs::create_dir_all(p.join("src")).unwrap();
+        fs::create_dir_all(p.join("target/debug")).unwrap();
+        fs::write(p.join(".gitignore"), "target/\n*.log\n").unwrap();
+        fs::write(p.join("target/debug/app"), vec![1u8; 100]).unwrap();
+        fs::write(p.join("src/main.rs"), vec![1u8; 10]).unwrap();
+        fs::write(p.join("notes.log"), vec![1u8; 5]).unwrap();
+
+        let s = scan(p, &opts()).unwrap();
+        // .gitignore and src/main.rs remain; target/ and *.log are ignored.
+        assert_eq!(s.tree.file_count(), 2);
+        assert!(s.tree.size < 100); // the 100 B binary and the log are gone
+        assert!(s.find(Path::new("target")).is_none());
+        assert!(s.stats.excluded >= 2);
+
+        // --no-ignore scans everything.
+        let o = ScanOptions {
+            no_ignore: true,
+            ..opts()
+        };
+        let s2 = scan(p, &o).unwrap();
+        assert_eq!(s2.tree.file_count(), 4);
+        assert!(s2.find(Path::new("target/debug/app")).is_some());
+    }
+
+    #[test]
+    fn nested_gitignore_overrides_and_negation() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        fs::create_dir_all(p.join("sub")).unwrap();
+        fs::write(p.join(".gitignore"), "*.tmp\n").unwrap();
+        fs::write(p.join("sub/.gitignore"), "!keep.tmp\n").unwrap();
+        fs::write(p.join("a.tmp"), vec![1u8; 10]).unwrap();
+        fs::write(p.join("sub/keep.tmp"), vec![1u8; 10]).unwrap();
+        fs::write(p.join("sub/b.tmp"), vec![1u8; 10]).unwrap();
+
+        let s = scan(p, &opts()).unwrap();
+        // a.tmp and sub/b.tmp ignored; sub/keep.tmp whitelisted by the deeper file.
+        assert!(s.find(Path::new("a.tmp")).is_none());
+        assert!(s.find(Path::new("sub/b.tmp")).is_none());
+        assert!(s.find(Path::new("sub/keep.tmp")).is_some());
     }
 
     #[test]

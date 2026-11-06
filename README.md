@@ -12,7 +12,7 @@ A TreeSize-style disk usage explorer for the terminal on Windows and Linux, with
 irm https://raw.githubusercontent.com/Errantial/cleanmcp/main/install.ps1 | iex
 ```
 
-**Linux** (x86_64 / arm64, static binary):
+**Linux / macOS** (x86_64 / arm64, static binary):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Errantial/cleanmcp/main/install.sh | sh
@@ -45,7 +45,49 @@ cleanmcp tree . --json                 # most commands support --json
 Sizes are space used on disk by default (`--apparent` for logical file sizes). Hard links are
 counted once on Linux; pass `--dedupe-hardlinks` to do the same on Windows (slower). Symlinks and
 junctions inside the tree are never followed (the scan root you pass is resolved first), and
-OneDrive online-only files count as 0 bytes on disk.
+OneDrive online-only files count as 0 bytes on disk. `.gitignore` / `.ignore` files are respected
+while scanning (`--no-ignore` to disable), and `cleanmcp du PATH` prints `du`-compatible output.
+
+## How does it compare?
+
+| | cleanmcp | dua | dust | gdu | ncdu | TreeSize |
+|---|---|---|---|---|---|---|
+| Platforms | Windows, Linux, macOS | Win/Linux/macOS | Win/Linux/macOS | Win/Linux/macOS | Linux/macOS | Windows |
+| Scan speed (1M+ entries) | fastest or parity — see [benchmarks](docs/benchmarks.md) | fast | slow on Windows | fast | n/a | GUI |
+| Interactive TUI | `cleanmcp ui` | yes | no | yes | yes | GUI |
+| Delete to trash | `ui`, MCP opt-in | yes | no | yes | yes | yes |
+| `.gitignore` respected | yes (`--no-ignore`) | no | yes | yes | no | filters |
+| Duplicate finder | `dupes` | no | no | no | no | yes |
+| Age / extension breakdowns | `age`, `ext` | partial | yes | yes | no | yes |
+| Cleanup suggestions with safety levels | `suggest` (~80 rules) | no | no | no | no | partial |
+| MCP server for AI agents | yes (8 tools + opt-in trash) | no | no | no | no | no |
+| Snapshots & diff over time | `snapshot`, `diff` | no | no | export/import | export/import | reports |
+
+Benchmark methodology and numbers: [docs/benchmarks.md](docs/benchmarks.md) (reproduce with
+`scripts/bench/`). Competitor flags verified at v1.0.0; tell us if the table is stale.
+
+## FAQ
+
+**Why not just `dua`/`dust`/`gdu`?** They are great scanners. cleanmcp adds what they don't have:
+a duplicate finder, ~80 cleanup rules with safety levels, snapshots you can diff over time, a
+`du`-compatible mode, and an MCP server so an AI agent can explore your disk and suggest (never
+perform, unless you opt in) cleanup. On raw scan speed we are at parity or faster
+([benchmarks](docs/benchmarks.md)).
+
+**Is it safe to let an agent use it?** The MCP server is read-only by default. `move_to_trash`
+only exists with `mcp --allow-delete`, only accepts paths a tool returned in that session, always
+refuses drive roots / system folders / your home folder / other profiles, moves to the Recycle
+Bin or Trash (never permanent), never follows links, and logs every attempt. `--root DIR` limits
+what the tools may touch. See [SECURITY.md](SECURITY.md).
+
+**Why does a scan report "N entries could not be read"?** Some folders need admin rights. Those
+entries are counted and reported (stderr note, `tree --json` `errors` field, MCP scan result)
+instead of being silently skipped, so totals you see are honest.
+
+**Windows vs Linux differences?** Sizes are allocated-on-disk by default on both. Linux counts
+hard links once for free; on Windows that needs `--dedupe-hardlinks` (slower). Linux skips
+`/proc`, `/sys`, `/dev`, `/run` unless `--include-virtual`; `--one-filesystem` (`-x`) stays on
+one filesystem. Windows never crosses mount points (they are reparse points, never followed).
 
 ### Custom cleanup rules
 

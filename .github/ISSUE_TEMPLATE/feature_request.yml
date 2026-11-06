@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest an idea or a new cleanup rule
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should cleanmcp do? CLI flags, MCP tools, rules — anything goes.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Other tools or workarounds (e.g. `du`, `dust`, a config rule) and why they fall short
+  - type: input
+    id: rule
+    attributes:
+      label: Is this a cleanup-rule request?
+      description: If yes, which folder pattern (e.g. `**/.venv`, `**/build`) and is it regenerable or needs review?
+      placeholder: "yes/no — pattern"

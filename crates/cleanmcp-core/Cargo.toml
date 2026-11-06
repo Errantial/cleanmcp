@@ -11,6 +11,7 @@ rayon.workspace = true
 serde.workspace = true
 schemars.workspace = true
 globset = "0.4.19"
+ignore = "0.4.34"
 dunce = "1.0.5"
 compact_str = { version = "0.10.0", features = ["serde"] }
 blake3 = "1.8.7"
