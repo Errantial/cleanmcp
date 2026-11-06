@@ -15,7 +15,8 @@ fn fixture() -> tempfile::TempDir {
     fs::create_dir_all(p.join("src")).unwrap();
     fs::create_dir_all(p.join("target/debug")).unwrap();
     fs::write(p.join(".gitignore"), "target/\n*.log\n").unwrap();
-    fs::write(p.join("src/main.rs"), vec![1u8; 1_000]).unwrap();
+    // Big enough to be the largest file even after cluster rounding on any OS.
+    fs::write(p.join("src/main.rs"), vec![1u8; 100_000]).unwrap();
     fs::write(p.join("src/lib.rs"), vec![1u8; 500]).unwrap();
     fs::write(p.join("target/debug/app"), vec![1u8; 100_000]).unwrap();
     fs::write(p.join("notes.log"), vec![1u8; 50]).unwrap();
@@ -113,7 +114,12 @@ fn du_prints_size_tab_path_per_directory() {
         assert!(size.parse::<u64>().is_ok(), "size is a number: {line}");
         assert!(Path::new(path).is_absolute() || path == ".");
     }
-    assert!(lines[0].ends_with(dir.path().to_str().unwrap()));
+    // The scan root is resolved (canonicalized), so compare canonical paths.
+    let root_line = lines[0].split_once('\t').unwrap().1;
+    assert_eq!(
+        std::fs::canonicalize(root_line).unwrap(),
+        std::fs::canonicalize(dir.path()).unwrap()
+    );
 
     // -a also lists files.
     let out = run(dir.path(), &["du", "-a", "-q"]);

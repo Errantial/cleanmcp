@@ -1,9 +1,6 @@
 # cargo-deny configuration: licenses, security advisories, duplicate/ban rules.
 # Run locally with: cargo deny check
 
-[graph]
-all-features = true
-
 [licenses]
 allow = [
     "MIT",

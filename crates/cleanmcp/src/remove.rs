@@ -122,7 +122,8 @@ mod tests {
         // The parent resolves to /usr/bin, so the target is refused. Check the
         // predicate directly: calling the trash here would move the real binary
         // if the guard ever regressed.
-        let target = deletion_target(&dir.path().join("l/bin/sh")).unwrap();
+        // /usr/bin exists on Linux and macOS alike (unlike /usr/bin/sh on macOS).
+        let target = deletion_target(&dir.path().join("l/bin")).unwrap();
         assert!(target.starts_with("/usr/bin"), "{}", target.display());
         assert!(
             protection_reason(&target).is_some(),
