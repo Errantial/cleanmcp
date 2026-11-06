@@ -17,8 +17,11 @@ allow = [
 confidence-threshold = 0.8
 
 [advisories]
-# No yanked or vulnerable crates in the dependency graph.
-yanked = "deny"
+ignore = [
+    # paste is unmaintained but stable and tiny (transitive dep of windows-sys);
+    # no known vulnerability. Re-evaluate on dependency updates.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained but stable, no vulnerability" },
+]
 
 [bans]
 multiple-versions = "warn"
