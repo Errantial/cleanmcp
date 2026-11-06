@@ -17,9 +17,8 @@ allow = [
 confidence-threshold = 0.8
 
 [advisories]
-# No unmaintained/vulnerable crates in the dependency graph.
+# No yanked or vulnerable crates in the dependency graph.
 yanked = "deny"
-unmaintained = "warn"
 
 [bans]
 multiple-versions = "warn"
